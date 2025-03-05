@@ -1,0 +1,5 @@
+package com.stockexchange.stock_platform.model.enums;
+
+public enum TransactionType {
+    BUY, SELL
+}

@@ -1,0 +1,33 @@
+spring.application.name=stock-platform
+
+# Database Connection
+spring.datasource.url=jdbc:postgresql://localhost:5432/stockexchange
+spring.datasource.username=kaankahveci
+spring.datasource.password=your_password
+spring.datasource.driver-class-name=org.postgresql.Driver
+
+# JPA / Hibernate
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
+
+# Server Configuration
+server.port=8080
+
+# External API Configuration
+alphavantage.apikey=your_api_key
+alphavantage.baseurl=https://www.alphavantage.co/query
+alphavantage.cachettl=3600000
+
+# Security Configuration
+spring.security.user.name=admin
+spring.security.user.password=password
+jwt.secret=your_jwt_secret_key
+jwt.expiration=86400000
+
+# Logging
+logging.level.org.springframework.web=INFO
+logging.level.com.stockexchange=DEBUG
+logging.level.org.hibernate.SQL=DEBUG
+logging.level.org.hibernate.type.descriptor.sql.BasicBinder=TRACE
