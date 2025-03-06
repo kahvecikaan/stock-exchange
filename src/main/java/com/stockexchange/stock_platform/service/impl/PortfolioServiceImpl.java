@@ -104,8 +104,7 @@ public class PortfolioServiceImpl implements PortfolioService, StockPriceObserve
 
         for (Holding holding : holdings) {
             StockPriceDto currentPrice = getCurrentPrice(holding.getSymbol());
-            // In a real application, you might want to update a "currentPrice" field
-            // or calculate and cache the current value
+            // TODO: Update the actual prices of holdings?
         }
     }
 

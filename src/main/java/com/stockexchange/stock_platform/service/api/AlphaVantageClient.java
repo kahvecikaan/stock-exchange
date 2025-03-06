@@ -58,7 +58,13 @@ public class AlphaVantageClient {
                 .queryParam("apikey", config.getApiKey())
                 .build()
                 .toUriString();
-
+        // TODO: Change deprecated method with the possible alternative below:
+        /*       UriComponentsBuilder.newInstance()
+                        .queryParam("function", "GLOBAL_QUOTE")
+                        .queryParam("symbol", symbol)
+                        .queryParam("apikey", config.getApiKey())
+                        .build()
+                        .toUriString(); */
         try {
             ResponseEntity<Map> response = restTemplate.getForEntity(url, Map.class);
 
