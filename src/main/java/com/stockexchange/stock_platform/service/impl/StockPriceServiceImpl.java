@@ -13,6 +13,8 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -71,10 +73,60 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
 
     @Override
     public List<StockPriceDto> getIntradayPrices(String symbol, String interval) {
-        // For intraday data, we always fetch from the API as it's more volatile
-        return apiClient.getIntradayPrices(symbol, interval);
-    }
+        // Fetch intraday data from API
+        List<StockPriceDto> intradayPrices = apiClient.getIntradayPrices(symbol, interval);
 
+        // The list is already sorted newest first (from AlphaVantageClient)
+        // Calculate change and change percent between consecutive time points
+        for (int i = 0; i < intradayPrices.size() - 1; i++) {
+            StockPriceDto currentPrice = intradayPrices.get(i);
+            StockPriceDto previousPrice = intradayPrices.get(i + 1);
+
+            // Calculate absolute change (current - previous)
+            BigDecimal priceChange = currentPrice.getPrice().subtract(previousPrice.getPrice());
+            currentPrice.setChange(priceChange);
+
+            // Calculate percentage change ((current - previous) / previous) * 100
+            if (previousPrice.getPrice().compareTo(BigDecimal.ZERO) > 0) {
+                BigDecimal changePercent = priceChange
+                        .multiply(new BigDecimal("100"))
+                        .divide(previousPrice.getPrice(), 4, RoundingMode.HALF_UP);
+                currentPrice.setChangePercent(changePercent);
+            } else {
+                // Avoid division by zero
+                currentPrice.setChangePercent(BigDecimal.ZERO);
+            }
+        }
+
+        // Handle the oldest data point (it has no previous point to compare with)
+        if (!intradayPrices.isEmpty() && intradayPrices.size() > 1) {
+            StockPriceDto oldestPrice = intradayPrices.getLast();
+
+            // For the oldest point, calculate change from the second-oldest point
+            // This gives us a reasonable "direction" value for the start of our data
+            StockPriceDto secondOldestPrice = intradayPrices.get(intradayPrices.size() - 2);
+            BigDecimal priceChange = oldestPrice.getPrice().subtract(secondOldestPrice.getPrice());
+
+            // The direction is inverted because we're going backward in time
+            oldestPrice.setChange(priceChange.negate());
+
+            if (secondOldestPrice.getPrice().compareTo(BigDecimal.ZERO) > 0) {
+                BigDecimal changePercent = priceChange
+                        .multiply(new BigDecimal("100"))
+                        .divide(secondOldestPrice.getPrice(), 4, RoundingMode.HALF_UP)
+                        .negate();
+                oldestPrice.setChangePercent(changePercent);
+            } else {
+                oldestPrice.setChangePercent(BigDecimal.ZERO);
+            }
+        } else if (intradayPrices.size() == 1) {
+            // If we only have one data point, set change to zero
+            intradayPrices.get(0).setChange(BigDecimal.ZERO);
+            intradayPrices.get(0).setChangePercent(BigDecimal.ZERO);
+        }
+
+        return intradayPrices;
+    }
     @Override
     public List<SearchResultDto> searchStocks(String keywords) {
         log.info("Searching for stocks matching: {}", keywords);
