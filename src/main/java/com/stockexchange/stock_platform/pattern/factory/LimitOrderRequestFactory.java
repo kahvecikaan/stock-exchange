@@ -1,6 +1,7 @@
 package com.stockexchange.stock_platform.pattern.factory;
 
 import com.stockexchange.stock_platform.model.enums.OrderSide;
+import com.stockexchange.stock_platform.model.enums.OrderType;
 import com.stockexchange.stock_platform.service.UserService;
 import org.springframework.stereotype.Component;
 
@@ -22,5 +23,10 @@ public class LimitOrderRequestFactory implements OrderRequestFactory {
             throw new IllegalArgumentException("Limit orders require a price");
         }
         return new LimitOrderRequest(userId, symbol, side, quantity, price, userService);
+    }
+
+    @Override
+    public OrderType getOrderType() {
+        return OrderType.LIMIT;
     }
 }

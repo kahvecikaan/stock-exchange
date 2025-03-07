@@ -1,5 +1,6 @@
 package com.stockexchange.stock_platform.service.impl;
 
+import com.stockexchange.stock_platform.dto.SearchResultDto;
 import com.stockexchange.stock_platform.dto.StockPriceDto;
 import com.stockexchange.stock_platform.model.entity.StockPrice;
 import com.stockexchange.stock_platform.pattern.observer.StockPriceObserver;
@@ -15,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Service
@@ -71,6 +73,23 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
     public List<StockPriceDto> getIntradayPrices(String symbol, String interval) {
         // For intraday data, we always fetch from the API as it's more volatile
         return apiClient.getIntradayPrices(symbol, interval);
+    }
+
+    @Override
+    public List<SearchResultDto> searchStocks(String keywords) {
+        log.info("Searching for stocks matching: {}", keywords);
+
+        List<Map<String, String>> searchResults = apiClient.searchSymbol(keywords);
+
+        return searchResults.stream()
+                .map(result -> SearchResultDto.builder()
+                        .symbol(result.get("1. symbol"))
+                        .name(result.get("2. name"))
+                        .type(result.get("3. type"))
+                        .region(result.get("4. region"))
+                        .currency(result.get("8. currency"))
+                        .build())
+                .collect(Collectors.toList());
     }
 
     @Override

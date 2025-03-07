@@ -3,7 +3,7 @@ package com.stockexchange.stock_platform.model.entity;
 import com.stockexchange.stock_platform.model.enums.TransactionType;
 import jakarta.persistence.*;
 import lombok.*;
-
+import org.hibernate.annotations.CreationTimestamp;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
@@ -14,7 +14,10 @@ import java.time.LocalDateTime;
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class Transaction extends BaseEntity {
+public class Transaction {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "user_id", nullable = false)
@@ -42,4 +45,8 @@ public class Transaction extends BaseEntity {
 
     @Column(name = "execution_time", nullable = false)
     private LocalDateTime executionTime;
+
+    @CreationTimestamp
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private LocalDateTime createdAt;
 }

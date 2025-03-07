@@ -1,6 +1,7 @@
 package com.stockexchange.stock_platform.controller;
 
 
+import com.stockexchange.stock_platform.dto.SearchResultDto;
 import com.stockexchange.stock_platform.dto.StockPriceDto;
 import com.stockexchange.stock_platform.service.StockPriceService;
 import lombok.RequiredArgsConstructor;
@@ -47,4 +48,10 @@ public class StockController {
         return ResponseEntity.ok(prices);
     }
 
+    @GetMapping("/search")
+    public ResponseEntity<List<SearchResultDto>> searchStocks(@RequestParam String keywords) {
+        log.info("Searching for stocks matching: {}", keywords);
+        List<SearchResultDto> results = stockPriceService.searchStocks(keywords);
+        return ResponseEntity.ok(results);
+    }
 }

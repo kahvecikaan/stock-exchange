@@ -9,4 +9,6 @@ import java.math.BigDecimal;
 public interface OrderRequestFactory {
     OrderRequest createOrderRequest(Long userId, String symbol, OrderSide side,
                                     BigDecimal quantity, BigDecimal price);
+
+    OrderType getOrderType();
 }

@@ -49,9 +49,7 @@ public class OrderServiceImpl implements OrderService {
 
         // Register factories by order type
         for (OrderRequestFactory factory : factoryList) {
-            // Create a simple order to determine its type
-            OrderRequest sampleOrder = factory.createOrderRequest(1L, "TEST", OrderSide.BUY, BigDecimal.ONE, BigDecimal.ONE);
-            orderFactories.put(sampleOrder.getOrderType(), factory);
+            orderFactories.put(factory.getOrderType(), factory);
         }
     }
 
@@ -157,7 +155,7 @@ public class OrderServiceImpl implements OrderService {
     }
 
     @Transactional
-    private void executeOrder(Order order) {
+    protected void executeOrder(Order order) {
         // Here we would implement order matching logic in a real exchange
         // For this example, we'll just process the order directly
 

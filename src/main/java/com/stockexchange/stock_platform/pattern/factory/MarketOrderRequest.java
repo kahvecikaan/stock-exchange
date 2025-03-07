@@ -15,7 +15,7 @@ public class MarketOrderRequest implements OrderRequest {
     private final String symbol;
     private final OrderSide side;
     private final BigDecimal quantity;
-    private BigDecimal price; // Determined at execution for market orders
+    private BigDecimal price; // Will be lazy-loaded
 
     private final UserService userService;
     private final StockPriceService stockPriceService;
@@ -29,13 +29,22 @@ public class MarketOrderRequest implements OrderRequest {
         this.userService = userService;
         this.stockPriceService = stockPriceService;
 
-        // For market orders, get the current price
-        this.price = stockPriceService.getCurrentPrice(symbol).getPrice();
+        // Don't fetch the price here -> lazy fetching
     }
 
     @Override
     public OrderType getOrderType() {
         return OrderType.MARKET;
+    }
+
+    @Override
+    public BigDecimal getPrice() {
+        // Lazy-load the price only when needed
+        if (price == null) {
+            this.price = stockPriceService.getCurrentPrice(symbol).getPrice();
+        }
+
+        return price;
     }
 
     @Override

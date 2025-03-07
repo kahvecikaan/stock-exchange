@@ -1,6 +1,7 @@
 package com.stockexchange.stock_platform.pattern.factory;
 
 import com.stockexchange.stock_platform.model.enums.OrderSide;
+import com.stockexchange.stock_platform.model.enums.OrderType;
 import com.stockexchange.stock_platform.service.StockPriceService;
 import com.stockexchange.stock_platform.service.UserService;
 import org.springframework.stereotype.Component;
@@ -23,5 +24,10 @@ public class MarketOrderRequestFactory implements OrderRequestFactory {
                                            BigDecimal quantity, BigDecimal price) {
         // For market orders, price parameter is ignored
         return new MarketOrderRequest(userId, symbol, side, quantity, userService, stockPriceService);
+    }
+
+    @Override
+    public OrderType getOrderType() {
+        return OrderType.MARKET;
     }
 }
