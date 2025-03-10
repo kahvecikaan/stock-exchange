@@ -11,7 +11,9 @@ public interface StockPriceService {
     StockPriceDto getCurrentPrice(String symbol);
     List<StockPriceDto> getHistoricalPrices(String symbol, LocalDateTime startTime, LocalDateTime endTime);
     List<StockPriceDto> getIntradayPrices(String symbol, String interval);
+    List<StockPriceDto> getWeeklyPrices(String symbol, int weeks);
+    List<StockPriceDto> getMonthlyPrices(String symbol, int months);
+    List<StockPriceDto> getPricesForTimeframe(String symbol, String timeframe);
     List<SearchResultDto> searchStocks(String keywords);
-    void refreshPrices(List<String> symbols);
     void saveStockPrice(StockPrice stockPrice);
 }
