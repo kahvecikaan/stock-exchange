@@ -17,6 +17,9 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.math.BigDecimal;
+import java.sql.Time;
+import java.sql.Timestamp;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
@@ -159,6 +162,55 @@ public class AlphaVantageClient {
         } catch (Exception e) {
             log.error("Error fetching intraday prices for {}: {}", symbol, e.getMessage());
             throw handleApiException("Error fetching intraday prices", e);
+        }
+    }
+
+    /**
+     * Gets weekly price data using the TIME_SERIES_WEEKLY endpoint
+     */
+    public List<StockPriceDto> getWeeklyPrices(String symbol) {
+        log.info("Fetching weekly prices for {}", symbol);
+        Map<String, Object> params = new HashMap<>();
+        params.put("function", "TIME_SERIES_WEEKLY");
+        params.put("symbol", symbol);
+
+        try {
+            Map<String, Object> responseBody = executeApiCall(params);
+            Map<String, Map<String, String>> timeSeries =
+                    (Map<String, Map<String, String>>) responseBody.get("Weekly Time Series");
+
+            if (timeSeries == null || timeSeries.isEmpty()) {
+                throw new ExternalApiException("Invalid response format from Alpha Vantage");
+            }
+
+            return parseWeeklyTimeSeriesData(symbol, timeSeries);
+        } catch (Exception e) {
+            throw handleApiException("Error fetching weekly prices", e);
+        }
+    }
+
+    /**
+     * Gets monthly price data using the TIME_SERIES_MONTHLY endpoint
+     */
+    public List<StockPriceDto> getMonthlyPrices(String symbol) {
+        log.info("Fetching monthly prices for {}", symbol);
+
+        Map<String, Object> params = new HashMap<>();
+        params.put("function", "TIME_SERIES_MONTHLY");
+        params.put("symbol", symbol);
+
+        try {
+            Map<String, Object> responseBody = executeApiCall(params);
+            Map<String, Map<String, String>> timeSeries =
+                    (Map<String, Map<String, String>>) responseBody.get("Monthly Time Series");
+
+            if (timeSeries == null || timeSeries.isEmpty()) {
+                throw new ExternalApiException("Invalid response format from Alpha Vantage");
+            }
+
+            return parseMonthlyTimeSeriesData(symbol, timeSeries);
+        } catch (Exception e) {
+            throw handleApiException("Error fetching monthly prices", e);
         }
     }
 
@@ -377,6 +429,84 @@ public class AlphaVantageClient {
         intradayPrices.sort(Comparator.comparing(StockPriceDto::getTimestamp).reversed());
 
         return intradayPrices;
+    }
+
+    /**
+     * Parses time series data from the weekly endpoint
+     */
+    public List<StockPriceDto> parseWeeklyTimeSeriesData(String symbol,
+                                                         Map<String, Map<String, String>> timeSeries) {
+        List<StockPriceDto> weeklyPrices = new ArrayList<>();
+
+        // Parse each week's data
+        for(Map.Entry<String, Map<String, String>> entry : timeSeries.entrySet()) {
+            String dateStr = entry.getKey();
+            Map<String, String> weeklyData = entry.getValue();
+
+            try {
+                // Parse data (format is YYYY-MM-DD)
+                // TODO: Enhance StockPriceDto to support timezone information
+                // 1. Add ZoneId sourceTimezone and ZonedDateTime zonedTimestamp fields to StockPriceDto
+                // 2. Update parsing methods to store timezone information
+                // 3. Add utility methods to convert timestamps to user's timezone
+                // 4. Add timezone parameter to controller endpoints
+                LocalDateTime date = LocalDateTime.parse(dateStr + " 16:00:00", DATE_TIME_FORMATTER);
+
+                StockPriceDto priceData = StockPriceDto.builder()
+                        .symbol(symbol)
+                        .timestamp(date)
+                        .open(parseBigDecimal(weeklyData.get("1. open")))
+                        .high(parseBigDecimal(weeklyData.get("2. high")))
+                        .low(parseBigDecimal(weeklyData.get("3. low")))
+                        .price(parseBigDecimal(weeklyData.get("4. close"))) // Close price as the main price
+                        .volume(parseLong(weeklyData.get("5. volume")))
+                        .build();
+
+                weeklyPrices.add(priceData);
+            } catch (DateTimeParseException e) {
+                log.warn("Failed to parse date: {}", dateStr, e);
+            } catch (Exception e) {
+                log.warn("Failed to parse date {} for: {}", dateStr, e.getMessage());
+            }
+        }
+
+        return weeklyPrices;
+    }
+
+    /**
+     * Parses time series data for monthly endpoint
+     */
+    private List<StockPriceDto> parseMonthlyTimeSeriesData(String symbol,
+                                                           Map<String, Map<String, String>> timeSeries) {
+        List<StockPriceDto> monthlyPrices = new ArrayList<>();
+
+        // Parse each month's data
+        for(Map.Entry<String, Map<String, String>> entry : timeSeries.entrySet()) {
+            String dateStr = entry.getKey();
+            Map<String, String> monthlyData = entry.getValue();
+            try {
+                // Parse date (format is YYYY-MM-DD)
+                LocalDateTime date = LocalDateTime.parse(dateStr + " 16:00:00", DATE_TIME_FORMATTER);
+
+                StockPriceDto priceData = StockPriceDto.builder()
+                        .symbol(symbol)
+                        .timestamp(date)
+                        .open(parseBigDecimal(monthlyData.get("1. open")))
+                        .high(parseBigDecimal(monthlyData.get("2. high")))
+                        .low(parseBigDecimal(monthlyData.get("3. low")))
+                        .price(parseBigDecimal(monthlyData.get("4. close"))) // Close price as the main price
+                        .volume(parseLong(monthlyData.get("5. volume")))
+                        .build();
+
+                monthlyPrices.add(priceData);
+            } catch (DateTimeParseException e) {
+                log.warn("Failed to parse date: {}", dateStr, e);
+            } catch (Exception e) {
+                log.warn("Failed to parse data for date {}: {}", dateStr, e.getMessage());
+            }
+        }
+
+        return monthlyPrices;
     }
 
     /**
