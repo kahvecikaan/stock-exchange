@@ -38,68 +38,41 @@ public class ChartDataServiceImpl implements ChartDataService {
 
     @Override
     public ChartDataDto getStockPriceChart(String symbol, String timeframe) {
-        LocalDateTime endTime = LocalDateTime.now();
-        LocalDateTime startTime;
-        String interval = "60min"; // Default interval
+        List<StockPriceDto> priceData = stockPriceService.getPricesForTimeframe(symbol, timeframe);
 
-        // Determine time range based on timeframe parameter
-        switch (timeframe.toLowerCase()) {
-            case "1d":
-                startTime = endTime.minusDays(1);
-                interval = "5min";
-                break;
-            case "1w":
-                startTime = endTime.minusDays(7);
-                interval = "60min";
-                break;
-            case "1m":
-                startTime = endTime.minusMonths(1);
-                break;
-            case "3m":
-                startTime = endTime.minusMonths(3);
-                break;
-            case "1y":
-                startTime = endTime.minusYears(1);
-                break;
-            default:
-                startTime = endTime.minusDays(30); // Default to 1 month
-                break;
-        }
-
-        List<StockPriceDto> priceData;
         boolean isIntraday = timeframe.equals("1d") || timeframe.equals("1w");
-
-        if (isIntraday) {
-            priceData = stockPriceService.getIntradayPrices(symbol, interval);
-            // Filter by date range
-            priceData = priceData.stream()
-                    .filter(p -> p.getTimestamp().isAfter(startTime) && p.getTimestamp().isBefore(endTime))
-                    .collect(Collectors.toList());
-        } else {
-            priceData = stockPriceService.getHistoricalPrices(symbol, startTime, endTime);
-        }
-
-        // Sort by timestamp
-        priceData.sort(Comparator.comparing(StockPriceDto::getTimestamp));
 
         // Prepare chart data
         List<String> labels = new ArrayList<>();
         List<Double> prices = new ArrayList<>();
         List<Double> volumes = new ArrayList<>();
+        List<Double> percentChanges = new ArrayList<>();
 
-        for (StockPriceDto price : priceData) {
+        // Use reversed order for chart data (oldest to newest)
+        for (int i = priceData.size() - 1; i >= 0; i--) {
+            StockPriceDto price = priceData.get(i);
+
+            // Format time labels based on timeframe
             String label = isIntraday ?
                     price.getTimestamp().format(TIME_FORMATTER) :
                     price.getTimestamp().format(DATE_FORMATTER);
             labels.add(label);
             prices.add(price.getPrice().doubleValue());
-            volumes.add(price.getVolume() != null ? price.getVolume().doubleValue() : 0.0);
+            volumes.add(price.getVolume() !=  null ? price.getVolume().doubleValue() : 0.0);
+
+            // Add percentage change as a dataset
+            if (price.getChangePercent() != null) {
+                percentChanges.add(price.getChangePercent().doubleValue());
+            } else {
+                percentChanges.add(0.0);
+            }
         }
 
         // Create datasets
         Map<String, List<Double>> datasets = new HashMap<>();
         datasets.put("Price", prices);
         datasets.put("Volume", volumes);
+        datasets.put("PercentChange", percentChanges);
 
         return ChartDataDto.builder()
                 .title(symbol + " Price Chart")
