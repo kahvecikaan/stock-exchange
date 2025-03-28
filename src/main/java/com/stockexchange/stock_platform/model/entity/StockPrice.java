@@ -17,7 +17,7 @@ import java.time.LocalDateTime;
 public class StockPrice {
     // Composite primary key for time-series data
     @Id
-    @Column(nullable = false)
+    @Column(name = "time", nullable = false, columnDefinition = "TIMESTAMPTZ")
     private LocalDateTime time;
 
     @Id
