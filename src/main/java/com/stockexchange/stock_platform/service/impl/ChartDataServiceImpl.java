@@ -12,13 +12,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
-import java.sql.Time;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -27,19 +25,16 @@ public class ChartDataServiceImpl implements ChartDataService {
     private final StockPriceService stockPriceService;
     private final UserRepository userRepository;
     private final HoldingRepository holdingRepository;
-    private final TimezoneService timezoneService;
 
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("MMM dd");
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
 
     public ChartDataServiceImpl(StockPriceService stockPriceService,
                                 UserRepository userRepository,
-                                HoldingRepository holdingRepository,
-                                TimezoneService timezoneService) {
+                                HoldingRepository holdingRepository) {
         this.stockPriceService = stockPriceService;
         this.userRepository = userRepository;
         this.holdingRepository = holdingRepository;
-        this.timezoneService = timezoneService;
     }
 
     @Override
@@ -121,26 +116,7 @@ public class ChartDataServiceImpl implements ChartDataService {
                 .orElseThrow(() -> new IllegalArgumentException("User not found"));
 
         LocalDateTime endTime = LocalDateTime.now();
-        LocalDateTime startTime;
-
-        // Determine time range based on timeframe parameter
-        switch (timeframe.toLowerCase()) {
-            case "1w":
-                startTime = endTime.minusDays(7);
-                break;
-            case "1m":
-                startTime = endTime.minusMonths(1);
-                break;
-            case "3m":
-                startTime = endTime.minusMonths(3);
-                break;
-            case "1y":
-                startTime = endTime.minusYears(1);
-                break;
-            default:
-                startTime = endTime.minusMonths(1); // Default to 1 month
-                break;
-        }
+        LocalDateTime startTime = calculateStartTime(timeframe, endTime);
 
         // Get all holdings
         List<Holding> holdings = holdingRepository.findByUser(user);
@@ -208,26 +184,7 @@ public class ChartDataServiceImpl implements ChartDataService {
     @Override
     public ChartDataDto getComparisonChart(String[] symbols, String timeframe, ZoneId timezone) {
         LocalDateTime endTime = LocalDateTime.now();
-        LocalDateTime startTime;
-
-        // Determine time range based on timeframe parameter
-        switch (timeframe.toLowerCase()) {
-            case "1w":
-                startTime = endTime.minusDays(7);
-                break;
-            case "1m":
-                startTime = endTime.minusMonths(1);
-                break;
-            case "3m":
-                startTime = endTime.minusMonths(3);
-                break;
-            case "1y":
-                startTime = endTime.minusYears(1);
-                break;
-            default:
-                startTime = endTime.minusMonths(1); // Default to 1 month
-                break;
-        }
+        LocalDateTime startTime = calculateStartTime(timeframe, endTime);
 
         // Get all dates in the range
         Set<LocalDateTime> allDates = new TreeSet<>();
@@ -299,5 +256,22 @@ public class ChartDataServiceImpl implements ChartDataService {
                 .labels(labels)
                 .datasets(datasets)
                 .build();
+    }
+
+    /**
+     * Calculates the start time based on the given timeframe parameter.
+     * @param timeframe String representation of the timeframe (1d, 1w, 1m, 3m, 1y)
+     * @param endTime The end time from which to calculate the start time
+     * @return The calculated start time
+     */
+    private LocalDateTime calculateStartTime(String timeframe, LocalDateTime endTime) {
+        return switch (timeframe.toLowerCase()) {
+            case "1d" -> endTime.minusDays(1);
+            case "1w" -> endTime.minusDays(7);
+            case "1m" -> endTime.minusMonths(1);
+            case "3m" -> endTime.minusMonths(3);
+            case "1y" -> endTime.minusYears(1);
+            default -> endTime.minusMonths(1); // Default to 1 month
+        };
     }
 }
