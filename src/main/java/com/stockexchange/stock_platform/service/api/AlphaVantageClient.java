@@ -17,10 +17,10 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.math.BigDecimal;
-import java.sql.Time;
-import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.*;
@@ -39,6 +39,10 @@ public class AlphaVantageClient {
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final int MAX_RETRY_ATTEMPTS = 3;
     private static final long RETRY_DELAY_MS = 2000;
+
+    // Timezone constants
+    private static final ZoneId MARKET_TIMEZONE = ZoneId.of("America/New_York");
+    private static final ZoneId UTC = ZoneId.of("UTC");
 
     public AlphaVantageClient(
             RestTemplate restTemplate,
@@ -81,6 +85,9 @@ public class AlphaVantageClient {
                 throw new ExternalApiException("Invalid response format from Alpha Vantage");
             }
 
+            // Create a ZonedDateTime with the market timezone
+            ZonedDateTime marketTime = ZonedDateTime.now(MARKET_TIMEZONE);
+
             // Parse the data from Global Quote response
             StockPriceDto stockPrice = StockPriceDto.builder()
                     .symbol(symbol)
@@ -91,7 +98,11 @@ public class AlphaVantageClient {
                     .volume(parseLong(globalQuote.get("06. volume")))
                     .change(parseBigDecimal(globalQuote.get("09. change")))
                     .changePercent(parseBigDecimal(globalQuote.get("10. change percent").replace("%", "")))
-                    .timestamp(LocalDateTime.now())
+                    // Keep the LocalDateTime for backward compatibility
+                    .timestamp(marketTime.toLocalDateTime())
+                    // Add timezone-aware timestamp
+                    .zonedTimestamp(marketTime)
+                    .sourceTimezone(MARKET_TIMEZONE)
                     .build();
 
             // Update cache
@@ -142,11 +153,15 @@ public class AlphaVantageClient {
             throw new IllegalArgumentException("Invalid interval. Must be one of: 1min, 5min, 15min, 30min, 60min");
         }
 
+        // Get current year-month for targeting data efficiently
+        String yearMonth = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM"));
+
         Map<String, Object> params = new HashMap<>();
         params.put("function", "TIME_SERIES_INTRADAY");
         params.put("symbol", symbol);
         params.put("interval", interval);
-        params.put("outputsize", "compact");
+        params.put("month", yearMonth);
+        params.put("outputsize", "full");
 
         try {
             Map<String, Object> responseBody = executeApiCall(params);
@@ -365,11 +380,17 @@ public class AlphaVantageClient {
 
             try {
                 // Parse date (format is YYYY-MM-DD)
-                LocalDateTime date = LocalDateTime.parse(dateStr + " 00:00:00", DATE_TIME_FORMATTER);
+                // Stock market daily data is for market close (4:00 PM ET)
+                LocalDateTime localDateTime = LocalDateTime.parse(dateStr + " 16:00:00", DATE_TIME_FORMATTER);
+
+                // Create a zoned datetime in the market timezone
+                ZonedDateTime marketTime = localDateTime.atZone(MARKET_TIMEZONE);
 
                 StockPriceDto priceData = StockPriceDto.builder()
                         .symbol(symbol)
-                        .timestamp(date)
+                        .timestamp(localDateTime)
+                        .zonedTimestamp(marketTime)
+                        .sourceTimezone(MARKET_TIMEZONE)
                         .open(parseBigDecimal(dailyData.get("1. open")))
                         .high(parseBigDecimal(dailyData.get("2. high")))
                         .low(parseBigDecimal(dailyData.get("3. low")))
@@ -405,11 +426,16 @@ public class AlphaVantageClient {
 
             try {
                 // Parse datetime
-                LocalDateTime dateTime = LocalDateTime.parse(dateTimeStr, DATE_TIME_FORMATTER);
+                LocalDateTime localDateTime = LocalDateTime.parse(dateTimeStr, DATE_TIME_FORMATTER);
+
+                // Create a zoned datetime in the market timezone
+                ZonedDateTime marketTime = localDateTime.atZone(MARKET_TIMEZONE);
 
                 StockPriceDto priceData = StockPriceDto.builder()
                         .symbol(symbol)
-                        .timestamp(dateTime)
+                        .timestamp(localDateTime)
+                        .zonedTimestamp(marketTime)
+                        .sourceTimezone(MARKET_TIMEZONE)
                         .open(parseBigDecimal(pricePoint.get("1. open")))
                         .high(parseBigDecimal(pricePoint.get("2. high")))
                         .low(parseBigDecimal(pricePoint.get("3. low")))
@@ -444,17 +470,17 @@ public class AlphaVantageClient {
             Map<String, String> weeklyData = entry.getValue();
 
             try {
-                // Parse data (format is YYYY-MM-DD)
-                // TODO: Enhance StockPriceDto to support timezone information
-                // 1. Add ZoneId sourceTimezone and ZonedDateTime zonedTimestamp fields to StockPriceDto
-                // 2. Update parsing methods to store timezone information
-                // 3. Add utility methods to convert timestamps to user's timezone
-                // 4. Add timezone parameter to controller endpoints
-                LocalDateTime date = LocalDateTime.parse(dateStr + " 16:00:00", DATE_TIME_FORMATTER);
+                // Weekly data is for the last trading day of the week (typically Friday at market close)
+                LocalDateTime localDateTime = LocalDateTime.parse(dateStr + " 16:00:00", DATE_TIME_FORMATTER);
+
+                // Create a zoned datetime in the market timezone
+                ZonedDateTime marketTime = localDateTime.atZone(MARKET_TIMEZONE);
 
                 StockPriceDto priceData = StockPriceDto.builder()
                         .symbol(symbol)
-                        .timestamp(date)
+                        .timestamp(localDateTime)
+                        .zonedTimestamp(marketTime)
+                        .sourceTimezone(MARKET_TIMEZONE)
                         .open(parseBigDecimal(weeklyData.get("1. open")))
                         .high(parseBigDecimal(weeklyData.get("2. high")))
                         .low(parseBigDecimal(weeklyData.get("3. low")))
@@ -469,6 +495,9 @@ public class AlphaVantageClient {
                 log.warn("Failed to parse date {} for: {}", dateStr, e.getMessage());
             }
         }
+
+        // Sort by timestamp, newest first
+        weeklyPrices.sort(Comparator.comparing(StockPriceDto::getTimestamp).reversed());
 
         return weeklyPrices;
     }
@@ -485,12 +514,17 @@ public class AlphaVantageClient {
             String dateStr = entry.getKey();
             Map<String, String> monthlyData = entry.getValue();
             try {
-                // Parse date (format is YYYY-MM-DD)
-                LocalDateTime date = LocalDateTime.parse(dateStr + " 16:00:00", DATE_TIME_FORMATTER);
+                // Monthly data is for the last trading day of the month at market close
+                LocalDateTime localDateTime = LocalDateTime.parse(dateStr + " 16:00:00", DATE_TIME_FORMATTER);
+
+                // Create a zoned datetime in the market timezone
+                ZonedDateTime marketTime = localDateTime.atZone(MARKET_TIMEZONE);
 
                 StockPriceDto priceData = StockPriceDto.builder()
                         .symbol(symbol)
-                        .timestamp(date)
+                        .timestamp(localDateTime)
+                        .zonedTimestamp(marketTime)
+                        .sourceTimezone(MARKET_TIMEZONE)
                         .open(parseBigDecimal(monthlyData.get("1. open")))
                         .high(parseBigDecimal(monthlyData.get("2. high")))
                         .low(parseBigDecimal(monthlyData.get("3. low")))
@@ -505,6 +539,9 @@ public class AlphaVantageClient {
                 log.warn("Failed to parse data for date {}: {}", dateStr, e.getMessage());
             }
         }
+
+        // Sort by timestamp, newest first
+        monthlyPrices.sort(Comparator.comparing(StockPriceDto::getTimestamp).reversed());
 
         return monthlyPrices;
     }
