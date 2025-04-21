@@ -16,7 +16,8 @@ public class WebConfig {
 
         // Allow all origins for development
         config.setAllowCredentials(true);
-        config.addAllowedOrigin("*");
+        config.addAllowedOrigin("http://localhost:3000"); // The Next.js frontend
+
         config.addAllowedHeader("*");
         config.addAllowedMethod("*");
 
