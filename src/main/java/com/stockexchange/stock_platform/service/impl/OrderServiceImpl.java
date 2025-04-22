@@ -16,36 +16,45 @@ import com.stockexchange.stock_platform.repository.HoldingRepository;
 import com.stockexchange.stock_platform.repository.OrderRepository;
 import com.stockexchange.stock_platform.repository.UserRepository;
 import com.stockexchange.stock_platform.service.OrderService;
+import com.stockexchange.stock_platform.service.StockPriceService;
 import com.stockexchange.stock_platform.service.UserService;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.DayOfWeek;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
 @Service
+@Slf4j
 public class OrderServiceImpl implements OrderService {
 
     private final OrderRepository orderRepository;
     private final UserRepository userRepository;
     private final HoldingRepository holdingRepository;
     private final UserService userService;
+    private final StockPriceService stockPriceService;
     private final Map<OrderType, OrderRequestFactory> orderFactories = new HashMap<>();
 
     public OrderServiceImpl(OrderRepository orderRepository,
                             UserRepository userRepository,
                             HoldingRepository holdingRepository,
                             UserService userService,
+                            StockPriceService stockPriceService,
                             List<OrderRequestFactory> factoryList) {
         this.orderRepository = orderRepository;
         this.userRepository = userRepository;
         this.holdingRepository = holdingRepository;
         this.userService = userService;
+        this.stockPriceService = stockPriceService;
 
         // Register factories by order type
         for (OrderRequestFactory factory : factoryList) {
@@ -89,9 +98,12 @@ public class OrderServiceImpl implements OrderService {
 
         Order savedOrder = orderRepository.save(order);
 
-        // For market orders, execute immediately
-        if (type == OrderType.MARKET) {
+        // For market orders, execute immediately if market is open, otherwise leave pending
+        if (type == OrderType.MARKET && isMarketOpen()) {
             executeOrder(savedOrder);
+        } else if (type == OrderType.MARKET) {
+            // Market is closed, log that this will execute at open
+            log.info("Market order created during off hours. Will execute at market open: {}", savedOrder.getId());
         }
 
         return convertToDto(savedOrder);
@@ -140,18 +152,50 @@ public class OrderServiceImpl implements OrderService {
     @Scheduled(fixedRate = 60000) // Run every minute
     @Transactional
     public void processOrders() {
-        // Find all pending limit orders
+        // Check if market is currently open
+        boolean marketOpen = isMarketOpen();
+
+        if (!marketOpen) {
+            // Don't process orders when market is closed
+            return;
+        }
+
+        // Find all pending orders
         List<Order> pendingOrders = orderRepository.findByStatus(OrderStatus.PENDING);
 
         for (Order order : pendingOrders) {
-            if (order.getOrderType() == OrderType.LIMIT) {
-                // Check if limit conditions are met
-                // In a real system, this would compare to current market prices
-                // For this example, we'll just execute all limit orders
-                // (In reality, you'd only execute if price conditions are met)
+            // Execute all market orders (these were placed when market was closed)
+            if (order.getOrderType() == OrderType.MARKET) {
+                log.info("Executing pending market order: {}", order.getId());
                 executeOrder(order);
             }
+            // For limit orders, check if conditions are met
+            else if (order.getOrderType() == OrderType.LIMIT) {
+                // Get current price
+                BigDecimal currentPrice = stockPriceService.getCurrentPrice(order.getSymbol()).getPrice();
+
+                boolean shouldExecute = isShouldExecute(order, currentPrice);
+
+                if (shouldExecute) {
+                    log.info("Executing limit order: {} (current price: {})", order.getId(), currentPrice);
+                    executeOrder(order);
+                }
+            }
         }
+    }
+
+    private static boolean isShouldExecute(Order order, BigDecimal currentPrice) {
+        boolean shouldExecute = false;
+
+        // For buy orders, execute if current price <= limit price
+        if (order.getSide() == OrderSide.BUY && currentPrice.compareTo(order.getPrice()) <= 0) {
+            shouldExecute = true;
+        }
+        // For sell orders, execute if current price >= limit price
+        else if (order.getSide() == OrderSide.SELL && currentPrice.compareTo(order.getPrice()) >= 0) {
+            shouldExecute = true;
+        }
+        return shouldExecute;
     }
 
     @Transactional
@@ -262,5 +306,28 @@ public class OrderServiceImpl implements OrderService {
                 .createdAt(order.getCreatedAt())
                 .updatedAt(order.getUpdatedAt())
                 .build();
+    }
+
+    // Helper method to check if market is open
+    private boolean isMarketOpen() {
+        ZonedDateTime nyTime = ZonedDateTime.now(ZoneId.of("America/New_York"));
+
+        // Check if weekend
+        DayOfWeek day = nyTime.getDayOfWeek();
+        if (day == DayOfWeek.SATURDAY || day == DayOfWeek.SUNDAY) {
+            return false;
+        }
+
+        // Check market hours (9:30 AM - 4:00 PM ET)
+        int hour = nyTime.getHour();
+        int minute = nyTime.getMinute();
+
+        // Before 9:30 AM
+        if (hour < 9 || (hour == 9 && minute < 30)) {
+            return false;
+        }
+
+        // After 4:00 PM
+        return hour < 16;
     }
 }
