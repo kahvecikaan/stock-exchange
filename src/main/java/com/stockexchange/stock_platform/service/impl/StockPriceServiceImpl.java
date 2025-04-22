@@ -104,26 +104,57 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
         List<StockPrice> prices = stockPriceRepository.findBySymbolAndTimeBetweenOrderByTimeAsc(
                 symbol, startTime, endTime);
 
+        int minRequiredPoints = 22;
+
         // If we don't have enough data, fetch it from the API
-        if (prices.isEmpty() || prices.size() < 5) { // Arbitrary threshold - if we have less than 5 points
+        if (prices.isEmpty() || prices.size() < minRequiredPoints) {
             int daysBetween = (int) java.time.Duration.between(startTime, endTime).toDays() + 1;
             historicalPrices = apiClient.getHistoricalDailyPrices(symbol, daysBetween);
 
             // Save the fetched data to database
             for (StockPriceDto priceDto : historicalPrices) {
-                if (priceDto.getTimestamp().isAfter(startTime) && priceDto.getTimestamp().isBefore(endTime)) {
+                // Use inclusive date range to include boundary dates
+                if (!priceDto.getTimestamp().isBefore(startTime) && !priceDto.getTimestamp().isAfter(endTime)) {
                     saveStockPriceFromDto(priceDto);
                 }
             }
 
-            historicalPrices =  historicalPrices.stream()
-                    .filter(p -> p.getTimestamp().isAfter(startTime) && p.getTimestamp().isBefore(endTime))
+            // Use inclusive filtering to include boundary dates
+            historicalPrices = historicalPrices.stream()
+                    .filter(p -> !p.getTimestamp().isBefore(startTime) && !p.getTimestamp().isAfter(endTime))
                     .collect(Collectors.toList());
         } else {
             // If we have the data in the database, convert to DTOs
             historicalPrices = prices.stream()
                     .map(this::convertToDto)
                     .collect(Collectors.toList());
+        }
+
+        // If we still don't have enough data points, try a direct API call with specific output
+        if (historicalPrices.size() < minRequiredPoints) {
+            try {
+                log.info("Attempting to fetch more detailed data for {} from API", symbol);
+                List<StockPriceDto> apiDirectData = apiClient.getHistoricalDailyPrices(symbol, 30);
+
+                if (apiDirectData.size() > historicalPrices.size()) {
+                    // Filter to our date range
+                    apiDirectData = apiDirectData.stream()
+                            .filter(p -> !p.getTimestamp().isBefore(startTime) && !p.getTimestamp().isAfter(endTime))
+                            .collect(Collectors.toList());
+
+                    if (apiDirectData.size() > historicalPrices.size()) {
+                        historicalPrices = apiDirectData;
+
+                        // Save these to the database for future use
+                        for (StockPriceDto priceDto : historicalPrices) {
+                            saveStockPriceFromDto(priceDto);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Failed to fetch additional data points from API: {}", e.getMessage());
+                // Continue with what we have
+            }
         }
 
         // Convert to requested timezone if needed
@@ -276,63 +307,141 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
         // Register this symbol for automatic tracking
         registerSymbolForTracking(symbol);
 
-        LocalDateTime now = LocalDateTime.now();
+        // Use ZonedDateTime and market timezone for accurate date calculations
+        ZoneId marketTimezone = ZoneId.of("America/New_York");
+        ZonedDateTime nowInMarketTz = ZonedDateTime.now(marketTimezone);
         List<StockPriceDto> prices;
 
         switch (timeframe.toLowerCase()) {
             case "1d":
-                List<StockPriceDto> dailyPrices = getIntradayPrices(symbol, "5min", timezone);
-                prices = filterForMostRecentTradingDay(dailyPrices);
-
+                // Fetch 5-minute interval data for the day
+                List<StockPriceDto> intradayPrices = getIntradayPrices(symbol, "5min", timezone);
+                // Filter down to only the most recent trading day's data
+                prices = filterForMostRecentTradingDay(intradayPrices); // Assumes this sorts oldest first
                 break;
+
             case "1w":
-                // 1 week - use intraday data with 30 min intervals
+                // Fetch 30-minute interval data
                 List<StockPriceDto> allWeeklyPrices = getIntradayPrices(symbol, "30min", timezone);
 
-                // Get current date in NYSE timezone
-                LocalDate todayNY = LocalDate.now(ZoneId.of("America/New_York"));
-                // Calculate the date 7 days ago
-                LocalDate weekAgoNY = todayNY.minusDays(7);
+                // Calculate the date 7 days ago in market time
+                LocalDate weekAgoMarket = nowInMarketTz.toLocalDate().minusDays(7);
 
-                // Filter for the last 7 days of trading data
+                // Filter for the last 7 calendar days
                 prices = allWeeklyPrices.stream()
                         .filter(price -> {
-                            // Convert timestamp to NYSE timezone for date comparison
-                            ZonedDateTime nyTime = price.getZonedTimestamp()
-                                    .withZoneSameInstant(ZoneId.of("America/New_York"));
-                            LocalDate priceDate = nyTime.toLocalDate();
+                            // Convert timestamp to market timezone for accurate date comparison
+                            ZonedDateTime priceTimeMarket = price.getZonedTimestamp()
+                                    .withZoneSameInstant(marketTimezone);
+                            LocalDate priceDateMarket = priceTimeMarket.toLocalDate();
 
-                            // Keep data points from the last 7 days
-                            return !priceDate.isBefore(weekAgoNY) && !priceDate.isAfter(todayNY);
+                            // Keep data points within the last 7 calendar days (inclusive)
+                            return !priceDateMarket.isBefore(weekAgoMarket) && !priceDateMarket.isAfter(nowInMarketTz.toLocalDate());
                         })
+                        .sorted(Comparator.comparing(StockPriceDto::getZonedTimestamp))
                         .collect(Collectors.toList());
 
-                // If we got no data from the last 7 days, use the most recent available data
-                if (prices.isEmpty()) {
-                    // Take the most recent 7 days of data available
-                    prices = getRecentTradingData(allWeeklyPrices, 7);
+                // Fallback if filtering removed all data (less likely with intraday but safe)
+                if (prices.isEmpty() && !allWeeklyPrices.isEmpty()) {
+                    // Get the most recent 7 data points as fallback
+                    prices = getRecentTradingData(allWeeklyPrices, 7); // Assumes this sorts oldest first
+                    log.warn("Filtering for 1w resulted in empty list for {}, using most recent points fallback.", symbol);
                 }
+                break;
 
-                break;
             case "1m":
-                // 1 month - use daily data
-                prices = getHistoricalPrices(symbol, now.minusMonths(1), now, timezone);
+                log.debug("Fetching '1m' timeframe data for {} using 60min interval.", symbol);
+                // Fetch intraday data (e.g., 60min interval)
+                List<StockPriceDto> allMonthlyIntradayPrices = getIntradayPrices(symbol, "60min", timezone);
+
+                // Define the start date for filtering (1 month ago in market time)
+                LocalDate monthAgoMarket = nowInMarketTz.toLocalDate().minusMonths(1);
+
+                // Filter the results to the precise 1-month window
+                prices = allMonthlyIntradayPrices.stream()
+                        .filter(price -> {
+                            // Convert timestamp to market timezone for accurate date comparison
+                            ZonedDateTime priceTimeMarket = price.getZonedTimestamp()
+                                    .withZoneSameInstant(marketTimezone);
+                            LocalDate priceDateMarket = priceTimeMarket.toLocalDate();
+
+                            // Keep data points from the last month (inclusive)
+                            return !priceDateMarket.isBefore(monthAgoMarket) && !priceDateMarket.isAfter(nowInMarketTz.toLocalDate());
+                        })
+                        .sorted(Comparator.comparing(StockPriceDto::getZonedTimestamp))
+                        .collect(Collectors.toList());
+
+                // If intraday fetch/filter failed or returned too little data, fallback to daily
+                // If < 5 points, daily might be better.
+                if (prices.size() < 5 && !allMonthlyIntradayPrices.isEmpty()) { // Check if filtering removed almost everything
+                    log.warn("Intraday data for 1m timeframe for {} resulted in only {} points after filtering. Falling back to daily data.", symbol, prices.size());
+                    LocalDateTime end = nowInMarketTz.toLocalDateTime();
+                    LocalDateTime start = end.minusMonths(1);
+                    prices = getHistoricalPrices(symbol, start, end, timezone);
+                    // Ensure daily data is also sorted correctly if not already done in getHistoricalPrices
+                    prices.sort(Comparator.comparing(StockPriceDto::getTimestamp)); // Use getTimestamp if Zoned might be null from DB
+                } else if (allMonthlyIntradayPrices.isEmpty()) {
+                    log.warn("Intraday data for 1m timeframe for {} was empty. Falling back to daily data.", symbol);
+                    LocalDateTime end = nowInMarketTz.toLocalDateTime();
+                    LocalDateTime start = end.minusMonths(1);
+                    prices = getHistoricalPrices(symbol, start, end, timezone);
+                    prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
+                }
                 break;
+
             case "3m":
                 // 3 months - use daily data
-                prices = getHistoricalPrices(symbol, now.minusMonths(3), now, timezone);
+                LocalDateTime end3m = nowInMarketTz.toLocalDateTime();
+                LocalDateTime start3m = end3m.minusMonths(3);
+                prices = getHistoricalPrices(symbol, start3m, end3m, timezone);
+                // Ensure sorted oldest first if getHistoricalPrices doesn't guarantee it
+                prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
                 break;
+
             case "1y":
                 // 1 year - use weekly data
-                prices = getWeeklyPrices(symbol, 52, timezone);
+                prices = getWeeklyPrices(symbol, 52, timezone); // Assumes API client returns newest first
+                // Sort oldest first for calculateChangesFromReference
+                prices.sort(Comparator.comparing(StockPriceDto::getZonedTimestamp));
                 break;
+
             case "5y":
                 // 5 years - use monthly data
-                prices = getMonthlyPrices(symbol, 60, timezone);
+                prices = getMonthlyPrices(symbol, 60, timezone); // Assumes API client returns newest first
+                // Sort oldest first for calculateChangesFromReference
+                prices.sort(Comparator.comparing(StockPriceDto::getZonedTimestamp));
                 break;
+
             default:
-                // Default to 1 month
-                prices = getHistoricalPrices(symbol, now.minusMonths(1), now, timezone);
+                log.warn("Unsupported timeframe '{}', defaulting to '1m'", timeframe);
+                // Default to 1 month - Apply the same improved logic as "1m" case
+
+                List<StockPriceDto> defaultIntradayPrices = getIntradayPrices(symbol, "60min", timezone);
+                LocalDate defaultMonthAgo = nowInMarketTz.toLocalDate().minusMonths(1);
+
+                prices = defaultIntradayPrices.stream()
+                        .filter(price -> {
+                            ZonedDateTime priceTimeMarket = price.getZonedTimestamp().withZoneSameInstant(marketTimezone);
+                            LocalDate priceDateMarket = priceTimeMarket.toLocalDate();
+                            return !priceDateMarket.isBefore(defaultMonthAgo) && !priceDateMarket.isAfter(nowInMarketTz.toLocalDate());
+                        })
+                        .sorted(Comparator.comparing(StockPriceDto::getZonedTimestamp)) // Sort oldest first
+                        .collect(Collectors.toList());
+
+                // Fallback for default case
+                if (prices.size() < 5 && !defaultIntradayPrices.isEmpty()) {
+                    log.warn("Default timeframe (1m) for {} resulted in only {} points after filtering intraday. Falling back to daily.", symbol, prices.size());
+                    LocalDateTime end = nowInMarketTz.toLocalDateTime();
+                    LocalDateTime start = end.minusMonths(1);
+                    prices = getHistoricalPrices(symbol, start, end, timezone);
+                    prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
+                } else if (defaultIntradayPrices.isEmpty()){
+                    log.warn("Default timeframe (1m) for {} intraday data was empty. Falling back to daily.", symbol);
+                    LocalDateTime end = nowInMarketTz.toLocalDateTime();
+                    LocalDateTime start = end.minusMonths(1);
+                    prices = getHistoricalPrices(symbol, start, end, timezone);
+                    prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
+                }
                 break;
         }
 
