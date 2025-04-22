@@ -17,7 +17,7 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.math.BigDecimal;
-import java.time.LocalDate;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -55,8 +55,7 @@ public class AlphaVantageClient {
     }
 
     /**
-     * Gets the current stock price using the GLOBAL_QUOTE endpoint.
-     * Uses a local cache with configurable TTL to minimize API calls.
+     * Gets the current stock price, using real-time data when the market is open.
      */
     public StockPriceDto getCurrentStockPrice(String symbol) {
         // Check cache first
@@ -64,8 +63,11 @@ public class AlphaVantageClient {
             LocalDateTime cacheTime = cacheTimestamps.get(symbol);
             long cacheTtlMillis = config.getCacheTtl();
 
+            // Use a shorter cache time during market hours
+            long effectiveCacheTtl = isDuringMarketHours() ? Math.min(cacheTtlMillis, 60_000) : cacheTtlMillis;
+
             // If cache hasn't expired, return cached value
-            if (cacheTime.plusNanos(cacheTtlMillis * 1_000_000).isAfter(LocalDateTime.now())) {
+            if (cacheTime.plusNanos(effectiveCacheTtl * 1_000_000).isAfter(LocalDateTime.now())) {
                 log.debug("Returning cached price for {}", symbol);
                 return priceCache.get(symbol);
             }
@@ -73,41 +75,21 @@ public class AlphaVantageClient {
 
         log.info("Fetching current price for {} from Alpha Vantage", symbol);
 
-        Map<String, Object> params = new HashMap<>();
-        params.put("function", "GLOBAL_QUOTE");
-        params.put("symbol", symbol);
-
         try {
-            Map<String, Object> responseBody = executeApiCall(params);
-            Map<String, String> globalQuote = (Map<String, String>) responseBody.get("Global Quote");
+            // Check if market is currently open
+            boolean marketOpen = isDuringMarketHours();
+            StockPriceDto stockPrice;
 
-            if (globalQuote == null || globalQuote.isEmpty()) {
-                throw new ExternalApiException("Invalid response format from Alpha Vantage");
+            if (marketOpen) {
+                // During market hours, use intraday data for the most current price
+                stockPrice = getMostRecentIntradayPrice(symbol);
+            } else {
+                // Outside market hours, use the global quote for the latest closing price
+                stockPrice = getLatestDailyPrice(symbol);
             }
-
-            // Create a ZonedDateTime with the market timezone
-            ZonedDateTime marketTime = ZonedDateTime.now(MARKET_TIMEZONE);
-
-            // Parse the data from Global Quote response
-            StockPriceDto stockPrice = StockPriceDto.builder()
-                    .symbol(symbol)
-                    .price(parseBigDecimal(globalQuote.get("05. price")))
-                    .open(parseBigDecimal(globalQuote.get("02. open")))
-                    .high(parseBigDecimal(globalQuote.get("03. high")))
-                    .low(parseBigDecimal(globalQuote.get("04. low")))
-                    .volume(parseLong(globalQuote.get("06. volume")))
-                    .change(parseBigDecimal(globalQuote.get("09. change")))
-                    .changePercent(parseBigDecimal(globalQuote.get("10. change percent").replace("%", "")))
-                    // Keep the LocalDateTime for backward compatibility
-                    .timestamp(marketTime.toLocalDateTime())
-                    // Add timezone-aware timestamp
-                    .zonedTimestamp(marketTime)
-                    .sourceTimezone(MARKET_TIMEZONE)
-                    .build();
 
             // Update cache
             updateCache(symbol, stockPrice);
-
             return stockPrice;
         } catch (Exception e) {
             log.error("Error fetching stock price for {}: {}", symbol, e.getMessage());
@@ -154,13 +136,13 @@ public class AlphaVantageClient {
         }
 
         // Get current year-month for targeting data efficiently
-        String yearMonth = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM"));
+        // String yearMonth = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy-MM"));
 
         Map<String, Object> params = new HashMap<>();
         params.put("function", "TIME_SERIES_INTRADAY");
         params.put("symbol", symbol);
         params.put("interval", interval);
-        params.put("month", yearMonth);
+        // params.put("month", yearMonth);
         params.put("outputsize", "full");
 
         try {
@@ -597,6 +579,178 @@ public class AlphaVantageClient {
         } catch (Exception e) {
             log.warn("Error parsing long value: {}", value);
             return 0L;
+        }
+    }
+
+    /**
+     * Determines if the US stock market is currently open.
+     * NYSE/NASDAQ trading hours are 9:30 AM - 4:00 PM Eastern Time, Monday-Friday.
+     */
+    private boolean isDuringMarketHours() {
+        ZonedDateTime nyTime = ZonedDateTime.now(MARKET_TIMEZONE);
+
+        // Check if it's a weekday
+        int dayOfWeek = nyTime.getDayOfWeek().getValue();
+        if (dayOfWeek > 5) { // Saturday = 6, Sunday = 7
+            return false;
+        }
+
+        // Check if it's between 9:30 AM and 4:00 PM ET
+        int hour = nyTime.getHour();
+        int minute = nyTime.getMinute();
+
+        // Before 9:30 AM
+        if (hour < 9 || (hour == 9 && minute < 30)) {
+            return false;
+        }
+
+        // After 4:00 PM
+        return hour < 16;
+
+        // Between 9:30 AM and 4:00 PM on a weekday
+    }
+
+    /**
+     * Gets the latest daily price using the GLOBAL_QUOTE endpoint.
+     */
+    private StockPriceDto getLatestDailyPrice(String symbol) {
+        Map<String, Object> params = new HashMap<>();
+        params.put("function", "GLOBAL_QUOTE");
+        params.put("symbol", symbol);
+
+        Map<String, Object> responseBody = executeApiCall(params);
+        Map<String, String> globalQuote = (Map<String, String>) responseBody.get("Global Quote");
+
+        if (globalQuote == null || globalQuote.isEmpty()) {
+            throw new ExternalApiException("Invalid response format from Alpha Vantage");
+        }
+
+        // Create a ZonedDateTime with the market timezone
+        ZonedDateTime marketTime = ZonedDateTime.now(MARKET_TIMEZONE);
+
+        return StockPriceDto.builder()
+                .symbol(symbol)
+                .price(parseBigDecimal(globalQuote.get("05. price")))
+                .open(parseBigDecimal(globalQuote.get("02. open")))
+                .high(parseBigDecimal(globalQuote.get("03. high")))
+                .low(parseBigDecimal(globalQuote.get("04. low")))
+                .volume(parseLong(globalQuote.get("06. volume")))
+                .change(parseBigDecimal(globalQuote.get("09. change")))
+                .changePercent(parseBigDecimal(globalQuote.get("10. change percent").replace("%", "")))
+                .timestamp(marketTime.toLocalDateTime())
+                .zonedTimestamp(marketTime)
+                .sourceTimezone(MARKET_TIMEZONE)
+                .build();
+    }
+
+    /**
+     * Gets the most recent intraday price using the TIME_SERIES_INTRADAY endpoint
+     * and calculates change values based on previous close.
+     */
+    private StockPriceDto getMostRecentIntradayPrice(String symbol) {
+        try {
+            // First, get the previous day's closing price for reference
+            BigDecimal previousClose = null;
+            try {
+                // Use GLOBAL_QUOTE to get the previous close
+                Map<String, Object> quoteParams = new HashMap<>();
+                quoteParams.put("function", "GLOBAL_QUOTE");
+                quoteParams.put("symbol", symbol);
+
+                Map<String, Object> quoteResponse = executeApiCall(quoteParams);
+                Map<String, String> globalQuote = (Map<String, String>) quoteResponse.get("Global Quote");
+
+                if (globalQuote != null && !globalQuote.isEmpty()) {
+                    // "08. previous close" contains the previous day's closing price
+                    previousClose = parseBigDecimal(globalQuote.get("08. previous close"));
+                    log.debug("Previous close for {}: {}", symbol, previousClose);
+                }
+            } catch (Exception e) {
+                log.warn("Could not retrieve previous close for {}: {}", symbol, e.getMessage());
+                // Continue even without previous close - we'll use a fallback
+            }
+
+            // Now get the current intraday price
+            Map<String, Object> params = new HashMap<>();
+            params.put("function", "TIME_SERIES_INTRADAY");
+            params.put("symbol", symbol);
+            params.put("interval", "1min");
+            params.put("outputsize", "compact");
+
+            Map<String, Object> responseBody = executeApiCall(params);
+
+            // Extract metadata to verify the data is fresh
+            Map<String, String> metadata = (Map<String, String>) responseBody.get("Meta Data");
+            String lastRefreshed = metadata.get("3. Last Refreshed");
+
+            // Extract the time series data
+            String timeSeriesKey = "Time Series (1min)";
+            Map<String, Map<String, String>> timeSeries = (Map<String, Map<String, String>>) responseBody.get(timeSeriesKey);
+
+            if (timeSeries == null || timeSeries.isEmpty()) {
+                throw new ExternalApiException("No intraday data available from Alpha Vantage");
+            }
+
+            // Get the most recent data point (first entry)
+            Map.Entry<String, Map<String, String>> firstEntry = timeSeries.entrySet().iterator().next();
+            String dateTimeStr = firstEntry.getKey();
+            Map<String, String> priceData = firstEntry.getValue();
+
+            // Parse the timestamp
+            LocalDateTime timestamp;
+            ZonedDateTime zonedTimestamp;
+            try {
+                timestamp = LocalDateTime.parse(dateTimeStr, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+                zonedTimestamp = timestamp.atZone(MARKET_TIMEZONE);
+            } catch (Exception e) {
+                log.warn("Failed to parse intraday timestamp: {}", dateTimeStr);
+                // Fallback to current time if parsing fails
+                zonedTimestamp = ZonedDateTime.now(MARKET_TIMEZONE);
+                timestamp = zonedTimestamp.toLocalDateTime();
+            }
+
+            // Parse the current price
+            BigDecimal currentPrice = parseBigDecimal(priceData.get("4. close"));
+
+            // Calculate change and percent change if we have a previous close
+            BigDecimal change = null;
+            BigDecimal changePercent = null;
+
+            if (previousClose != null && previousClose.compareTo(BigDecimal.ZERO) > 0) {
+                change = currentPrice.subtract(previousClose);
+                changePercent = change.multiply(new BigDecimal("100"))
+                        .divide(previousClose, 4, RoundingMode.HALF_UP);
+                log.debug("Calculated change for {}: {} ({}%)", symbol, change, changePercent);
+            } else {
+                // If we couldn't get previous close, try to get day's open price as fallback
+                BigDecimal todayOpen = parseBigDecimal(priceData.get("1. open"));
+                if (todayOpen.compareTo(BigDecimal.ZERO) > 0) {
+                    change = currentPrice.subtract(todayOpen);
+                    changePercent = change.multiply(new BigDecimal("100"))
+                            .divide(todayOpen, 4, RoundingMode.HALF_UP);
+                    log.debug("Using day's open as fallback for change calculation: {} ({}%)", change, changePercent);
+                } else {
+                    log.warn("Could not calculate change values for {}", symbol);
+                }
+            }
+
+            // Build the stock price DTO with change values
+            return StockPriceDto.builder()
+                    .symbol(symbol)
+                    .price(currentPrice)
+                    .open(parseBigDecimal(priceData.get("1. open")))
+                    .high(parseBigDecimal(priceData.get("2. high")))
+                    .low(parseBigDecimal(priceData.get("3. low")))
+                    .volume(parseLong(priceData.get("5. volume")))
+                    .change(change)
+                    .changePercent(changePercent)
+                    .timestamp(timestamp)
+                    .zonedTimestamp(zonedTimestamp)
+                    .sourceTimezone(MARKET_TIMEZONE)
+                    .build();
+        } catch (Exception e) {
+            log.error("Error fetching intraday price for {}: {}", symbol, e.getMessage());
+            throw new ExternalApiException("Failed to get intraday price: " + e.getMessage(), e);
         }
     }
 }
