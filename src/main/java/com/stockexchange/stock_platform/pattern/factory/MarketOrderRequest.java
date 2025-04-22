@@ -52,7 +52,12 @@ public class MarketOrderRequest implements OrderRequest {
         User user = userService.getUserById(userId);
 
         if (side == OrderSide.BUY) {
-            // Check if user has enough cash for the purchase
+            // Get the price if it's null
+            if (this.price == null) {
+                this.price = stockPriceService.getCurrentPrice(symbol).getPrice();
+            }
+
+            // Now price should never be null
             BigDecimal orderCost = price.multiply(quantity);
             return user.getCashBalance().compareTo(orderCost) >= 0;
         } else if (side == OrderSide.SELL) {
