@@ -27,7 +27,9 @@ public class ChartDataServiceImpl implements ChartDataService {
     private final HoldingRepository holdingRepository;
 
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("MMM dd");
+    private static final DateTimeFormatter WEEKLY_FORMATTER = DateTimeFormatter.ofPattern("MMM dd HH:mm");
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
+    private static final DateTimeFormatter YEARLY_FORMATTER = DateTimeFormatter.ofPattern("MMM dd, yyyy");
 
     public ChartDataServiceImpl(StockPriceService stockPriceService,
                                 UserRepository userRepository,
@@ -57,18 +59,50 @@ public class ChartDataServiceImpl implements ChartDataService {
         priceData.sort(Comparator.comparing(StockPriceDto::getTimestamp));
 
         for (StockPriceDto price : priceData) {
-            // Get the timestamp in the target timezone
-            ZonedDateTime zdt = price.getZonedTimestamp();
-            if (zdt == null && price.getTimestamp() != null) {
-                // Fallback if zonedTimestamp is not set
-                zdt = price.getTimestamp().atZone(TimezoneService.DEFAULT_MARKET_TIMEZONE)
+            // Get the timestamp
+            ZonedDateTime zdt = null;
+
+            // Critical fix: Ensure we start with the correct timezone interpretation
+            if (price.getZonedTimestamp() != null) {
+                // If we already have a ZonedDateTime, just ensure it's in the requested timezone
+                zdt = price.getZonedTimestamp().withZoneSameInstant(timezone);
+            } else if (price.getTimestamp() != null && price.getSourceTimezone() != null) {
+                // If we have timestamp with source timezone info, convert properly
+                zdt = price.getTimestamp()
+                        .atZone(price.getSourceTimezone())
+                        .withZoneSameInstant(timezone);
+            } else if (price.getTimestamp() != null) {
+                // Assume the timestamp is in market timezone if not specified
+                // THIS IS THE KEY FIX - ensuring proper timezone chain
+                zdt = price.getTimestamp()
+                        .atZone(TimezoneService.DEFAULT_MARKET_TIMEZONE)
                         .withZoneSameInstant(timezone);
             }
 
             // Format time labels based on timeframe
             String label;
             if (zdt != null) {
-                label = isIntraday ? zdt.format(TIME_FORMATTER) : zdt.format(DATE_FORMATTER);
+                // Adjust the formatting based on specific timeframe
+                label = switch (timeframe) {
+                    case "1d" ->
+                        // For daily chart, show time only
+                            zdt.format(TIME_FORMATTER);
+                    case "1w" ->
+                        // For weekly chart, show both date and time
+                            zdt.format(WEEKLY_FORMATTER);
+                    case "1y", "5y" ->
+                        // For yearly charts, show date and year
+                            zdt.format(YEARLY_FORMATTER);
+                    default ->
+                        // For other timeframes show date only
+                            zdt.format(DATE_FORMATTER);
+                };
+
+                // Debug log the timezone conversion
+                log.debug("Chart timestamp: {} from {} converted to {} timezone",
+                        price.getTimestamp(),
+                        price.getSourceTimezone() != null ? price.getSourceTimezone() : "default market",
+                        timezone);
             } else {
                 // Fallback if timestamp is not available
                 label = "N/A";
@@ -98,7 +132,7 @@ public class ChartDataServiceImpl implements ChartDataService {
 
         return ChartDataDto.builder()
                 .title(title)
-                .xAxisLabel("Time")
+                .xAxisLabel(isIntraday ? "Time" : "Date")
                 .yAxisLabel("Price")
                 .labels(labels)
                 .datasets(datasets)
