@@ -16,9 +16,12 @@ spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
 server.port=8080
 
 # External API Configuration
-alphavantage.apikey=your_api_key
-alphavantage.baseurl=https://www.alphavantage.co/query
-alphavantage.cachettl=3600000
+alpaca.apiKey=your_api_key
+alpaca.apiSecret=your_secret_key
+alpaca.dataBaseUrl=https://data.alpaca.markets
+alpaca.tradingBaseUrl=https://api.alpaca.markets
+alpaca.wsBaseUrl=wss://stream.data.alpaca.markets
+alpaca.maxRequestPerMinute=200
 
 # Security Configuration
 spring.security.user.name=admin

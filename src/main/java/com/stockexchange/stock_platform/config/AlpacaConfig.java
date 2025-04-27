@@ -12,7 +12,6 @@ import org.springframework.context.annotation.Configuration;
 public class AlpacaConfig {
     private String apiKey;
     private String apiSecret;
-    private String baseurl;
     private String dataBaseUrl;
     private String tradingBaseUrl;
     private String wsBaseUrl;
