@@ -1,3 +1,4 @@
+
 package com.stockexchange.stock_platform.dto;
 
 import lombok.AllArgsConstructor;
@@ -10,9 +11,13 @@ import lombok.NoArgsConstructor;
 @NoArgsConstructor
 @AllArgsConstructor
 public class SearchResultDto {
-    private String symbol;
-    private String name;
-    private String type;
-    private String region;
-    private String currency;
+    private String id;          // Asset ID from Alpaca
+    private String symbol;      // Stock symbol (e.g., AMPL)
+    private String name;        // Company name (e.g., Apple Inc. Common Stock)
+    private String type;        // Asset class (e.g., us_equity)
+    private String exchange;    // Exchange (e.g., NASDAQ)
+    private String region;      // Region (e.g., US)
+    private String currency;    // Currency (e.g., USD)
+    private boolean tradable;   // Whether the asset is tradable
+    private boolean fractionable; // Whether fractional shares are supported
 }
