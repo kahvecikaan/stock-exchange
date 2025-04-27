@@ -7,9 +7,10 @@ import com.stockexchange.stock_platform.pattern.observer.StockPriceObserver;
 import com.stockexchange.stock_platform.pattern.observer.StockPriceSubject;
 import com.stockexchange.stock_platform.repository.StockPriceRepository;
 import com.stockexchange.stock_platform.service.StockPriceService;
-import com.stockexchange.stock_platform.service.api.AlphaVantageClient;
+import com.stockexchange.stock_platform.service.api.AlpacaClient;
+import com.stockexchange.stock_platform.service.api.AlpacaWebSocketClient;
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -17,74 +18,130 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.*;
-import java.time.ZoneId;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service
 @Slf4j
-public class StockPriceServiceImpl implements StockPriceService, StockPriceSubject {
+public class StockPriceServiceImpl implements StockPriceService, StockPriceSubject, StockPriceObserver {
 
-    private final AlphaVantageClient apiClient;
+    private final AlpacaClient alpacaClient;
+    private final AlpacaWebSocketClient webSocketClient;
     private final StockPriceRepository stockPriceRepository;
     private final TimezoneService timezoneService;
+
+    // Observers that will be notified of price updates
     private final List<StockPriceObserver> observers = new ArrayList<>();
+
+    // Set of actively tracked symbols
     private final Set<String> activeSymbols = ConcurrentHashMap.newKeySet();
 
-    public StockPriceServiceImpl(AlphaVantageClient apiClient,
+    // Cache for real-time prices from WebSocket
+    private final Map<String, StockPriceDto> realtimePrices = new ConcurrentHashMap<>();
+
+    public StockPriceServiceImpl(AlpacaClient alpacaClient,
+                                 AlpacaWebSocketClient webSocketClient,
                                  StockPriceRepository stockPriceRepository,
                                  TimezoneService timezoneService) {
-        this.apiClient = apiClient;
+        this.alpacaClient = alpacaClient;
+        this.webSocketClient = webSocketClient;
         this.stockPriceRepository = stockPriceRepository;
         this.timezoneService = timezoneService;
     }
 
+    @PostConstruct
+    public void init() {
+        // Register as an observer of the WebSocket client to receive real-time updates
+        webSocketClient.registerObserver(this);
+        log.info("StockPriceService registered as observer of WebSocket client");
+    }
+
     /**
-     * Register a symbol for automatic tracking in the background refresh
+     * Register a symbol for automatic tracking in real-time
      * @param symbol The stock symbol to track
      */
     public void registerSymbolForTracking(String symbol) {
         if (symbol != null && !symbol.isBlank()) {
-            activeSymbols.add(symbol.toUpperCase());
+            symbol = symbol.toUpperCase();
+            activeSymbols.add(symbol);
+
+            // Also subscribe to WebSocket updates for this symbol
+            webSocketClient.subscribeToSymbol(symbol);
+
             log.debug("Registered symbol for tracking: {}", symbol);
         }
     }
 
+    /**
+     * Handles real-time price updates from WebSocket
+     * This method is called when the WebSocket client receives a price update
+     */
+    @Override
+    public void update(StockPriceDto stockPrice) {
+        if (stockPrice == null || stockPrice.getSymbol() == null) {
+            return;
+        }
+
+        String symbol = stockPrice.getSymbol().toUpperCase();
+
+        // Update our real-time price cache
+        realtimePrices.put(symbol, stockPrice);
+
+        // Save to database for historical record
+        saveStockPriceFromDto(stockPrice);
+
+        // Notify our own observers of the price update
+        notifyObservers(stockPrice);
+
+        log.debug("Received real-time update for {}: {}", symbol, stockPrice.getPrice());
+    }
+
     @Override
     public StockPriceDto getCurrentPrice(String symbol) {
-        // Call the timezone-aware version with default market timezone
         return getCurrentPrice(symbol, TimezoneService.DEFAULT_MARKET_TIMEZONE);
     }
 
     @Override
-    public StockPriceDto getCurrentPrice(String symbol, ZoneId timezone) {
-        // Register this symbol for automatic tracking
+    public StockPriceDto getCurrentPrice(String symbol, ZoneId userTimezone) {
+        symbol = symbol.toUpperCase();
+
+        // Register this symbol for real-time tracking
         registerSymbolForTracking(symbol);
 
-        StockPriceDto stockPrice = apiClient.getCurrentStockPrice(symbol);
+        // First check if we have a real-time price from WebSocket
+        StockPriceDto realtimePrice = realtimePrices.get(symbol);
 
-        // Ensure timezone information is properly set
-        if (stockPrice.getZonedTimestamp() == null && stockPrice.getTimestamp() != null) {
-            // If the API client didn't set zonedTimestamp, create it using market timezone
-            ZonedDateTime marketTime = stockPrice.getTimestamp()
-                    .atZone(TimezoneService.DEFAULT_MARKET_TIMEZONE);
-            stockPrice.setZonedTimestamp(marketTime);
-            stockPrice.setSourceTimezone(TimezoneService.DEFAULT_MARKET_TIMEZONE);
+        if (realtimePrice != null) {
+            log.debug("Using real-time price for {}: {}", symbol, realtimePrice.getPrice());
+
+            // Convert to the user's timezone if needed
+            if (userTimezone != null && realtimePrice.getSourceTimezone() != null &&
+                    !userTimezone.equals(realtimePrice.getSourceTimezone())) {
+
+                return convertToUserTimezone(realtimePrice, userTimezone);
+            }
+
+            return realtimePrice;
         }
 
-        // Convert to requested timezone if different from source
-        if (timezone != null && stockPrice.getSourceTimezone() != null &&
-                !timezone.equals(stockPrice.getSourceTimezone())) {
-            assert stockPrice.getZonedTimestamp() != null;
-            ZonedDateTime convertedTime = stockPrice.getZonedTimestamp()
-                    .withZoneSameInstant(timezone);
-            stockPrice.setZonedTimestamp(convertedTime);
+        // If no real-time price available, get from REST API
+        log.debug("No real-time price available for {}, using REST API", symbol);
+        StockPriceDto stockPrice = alpacaClient.getCurrentPrice(symbol);
+
+        // Convert to user's timezone if needed
+        if (userTimezone != null && stockPrice.getSourceTimezone() != null &&
+                !userTimezone.equals(stockPrice.getSourceTimezone())) {
+
+            stockPrice = convertToUserTimezone(stockPrice, userTimezone);
         }
 
+        // Save to database and notify observers
         saveStockPriceFromDto(stockPrice);
         notifyObservers(stockPrice);
+
         return stockPrice;
     }
 
@@ -94,473 +151,374 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
     }
 
     @Override
-    public List<StockPriceDto> getHistoricalPrices(String symbol, LocalDateTime startTime, LocalDateTime endTime, ZoneId timezone) {
-        // Register this symbol for automatic tracking
+    public List<StockPriceDto> getHistoricalPrices(String symbol, LocalDateTime startTime, LocalDateTime endTime, ZoneId userTimezone) {
+        symbol = symbol.toUpperCase();
+
+        // Register for real-time updates
         registerSymbolForTracking(symbol);
 
-        List<StockPriceDto> historicalPrices;
-
-        // First check if we have the data in our database
-        List<StockPrice> prices = stockPriceRepository.findBySymbolAndTimeBetweenOrderByTimeAsc(
+        // Check if we have data in our database first
+        List<StockPrice> dbPrices = stockPriceRepository.findBySymbolAndTimeBetweenOrderByTimeAsc(
                 symbol, startTime, endTime);
 
-        int minRequiredPoints = 22;
+        // Determine appropriate timeframe for Alpaca API
+        String timeframe = determineTimeframeForDateRange(startTime, endTime);
 
-        // If we don't have enough data, fetch it from the API
-        if (prices.isEmpty() || prices.size() < minRequiredPoints) {
-            int daysBetween = (int) java.time.Duration.between(startTime, endTime).toDays() + 1;
-            historicalPrices = apiClient.getHistoricalDailyPrices(symbol, daysBetween);
+        List<StockPriceDto> prices;
 
-            // Save the fetched data to database
-            for (StockPriceDto priceDto : historicalPrices) {
-                // Use inclusive date range to include boundary dates
-                if (!priceDto.getTimestamp().isBefore(startTime) && !priceDto.getTimestamp().isAfter(endTime)) {
-                    saveStockPriceFromDto(priceDto);
-                }
+        // If not enough data in database, fetch from API
+        if (dbPrices.size() < 10) { // Arbitrary threshold to determine if we need more data
+            prices = alpacaClient.getHistoricalBars(symbol, timeframe, startTime, endTime);
+
+            // Save to database for future use
+            for (StockPriceDto price : prices) {
+                saveStockPriceFromDto(price);
             }
-
-            // Use inclusive filtering to include boundary dates
-            historicalPrices = historicalPrices.stream()
-                    .filter(p -> !p.getTimestamp().isBefore(startTime) && !p.getTimestamp().isAfter(endTime))
-                    .collect(Collectors.toList());
         } else {
-            // If we have the data in the database, convert to DTOs
-            historicalPrices = prices.stream()
+            // Convert database entities to DTOs
+            prices = dbPrices.stream()
                     .map(this::convertToDto)
                     .collect(Collectors.toList());
-        }
 
-        // If we still don't have enough data points, try a direct API call with specific output
-        if (historicalPrices.size() < minRequiredPoints) {
-            try {
-                log.info("Attempting to fetch more detailed data for {} from API", symbol);
-                List<StockPriceDto> apiDirectData = apiClient.getHistoricalDailyPrices(symbol, 30);
-
-                if (apiDirectData.size() > historicalPrices.size()) {
-                    // Filter to our date range
-                    apiDirectData = apiDirectData.stream()
-                            .filter(p -> !p.getTimestamp().isBefore(startTime) && !p.getTimestamp().isAfter(endTime))
-                            .collect(Collectors.toList());
-
-                    if (apiDirectData.size() > historicalPrices.size()) {
-                        historicalPrices = apiDirectData;
-
-                        // Save these to the database for future use
-                        for (StockPriceDto priceDto : historicalPrices) {
-                            saveStockPriceFromDto(priceDto);
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                log.warn("Failed to fetch additional data points from API: {}", e.getMessage());
-                // Continue with what we have
+            // Convert to user timezone if needed
+            if (userTimezone != null) {
+                prices = prices.stream()
+                        .map(price -> convertToUserTimezone(price, userTimezone))
+                        .collect(Collectors.toList());
             }
+
+            // Recalculate changes since these come from DB
+            calculateChangesFromReference(prices);
         }
 
-        // Convert to requested timezone if needed
-        if (timezone != null) {
-            for (StockPriceDto price : historicalPrices) {
-                // Ensure timezone information is set
-                if (price.getZonedTimestamp() == null && price.getTimestamp() != null) {
-                    // If zonedTimestamp isn't set, create it using UTC (database default)
-                    ZonedDateTime utcTime = price.getTimestamp().atZone(ZoneId.of("UTC"));
-                    price.setZonedTimestamp(utcTime);
-                    price.setSourceTimezone(ZoneId.of("UTC"));
-                }
-
-                // Convert to target timezone
-                if (price.getZonedTimestamp() != null && price.getSourceTimezone() != null &&
-                        !timezone.equals(price.getSourceTimezone())) {
-                    price.setZonedTimestamp(
-                            timezoneService.convertTimezone(price.getZonedTimestamp(), timezone)
-                    );
-                }
-            }
-        }
-
-        return historicalPrices;
+        return prices;
     }
 
     @Override
     public List<StockPriceDto> getIntradayPrices(String symbol, String interval) {
-        // Call the timezone-aware version with the default market timezone
         return getIntradayPrices(symbol, interval, TimezoneService.DEFAULT_MARKET_TIMEZONE);
     }
 
     @Override
-    public List<StockPriceDto> getIntradayPrices(String symbol, String interval, ZoneId timezone) {
-        // Register this symbol for automatic tracking
+    public List<StockPriceDto> getIntradayPrices(String symbol, String interval, ZoneId userTimezone) {
+        symbol = symbol.toUpperCase();
+
+        // Register for real-time updates
         registerSymbolForTracking(symbol);
 
-        // Fetch intraday data from API
-        // The list already sorted newest first (from Alpha Vantage)
-        List<StockPriceDto> intradayPrices = apiClient.getIntradayPrices(symbol, interval);
+        // Convert interval to Alpaca format
+        String alpacaInterval = convertToAlpacaTimeframe(interval);
 
-        if(intradayPrices.isEmpty()) {
-            return intradayPrices;
+        // Get today's date for the timeframe
+        LocalDateTime endTime = LocalDateTime.now();
+        LocalDateTime startTime = endTime.toLocalDate().atStartOfDay();
+
+        // Use historical bars with intraday timeframe
+        List<StockPriceDto> prices = alpacaClient.getHistoricalBars(
+                symbol, alpacaInterval, startTime, endTime);
+
+        // Save to database
+        for (StockPriceDto price : prices) {
+            saveStockPriceFromDto(price);
         }
 
-        // Ensure timezone information is properly set
-        for (StockPriceDto price : intradayPrices) {
-            if (price.getZonedTimestamp() == null && price.getTimestamp() != null) {
-                ZonedDateTime marketTime = price.getTimestamp()
-                        .atZone(TimezoneService.DEFAULT_MARKET_TIMEZONE);
-                price.setZonedTimestamp(marketTime);
-                price.setSourceTimezone(TimezoneService.DEFAULT_MARKET_TIMEZONE);
+        // Add the most recent real-time price if available
+        StockPriceDto realtimePrice = realtimePrices.get(symbol);
+        if (realtimePrice != null) {
+            // Convert to user timezone if needed
+            if (userTimezone != null && !userTimezone.equals(realtimePrice.getSourceTimezone())) {
+                realtimePrice = convertToUserTimezone(realtimePrice, userTimezone);
             }
 
-            // Convert to requested timezone if needed
-            if (timezone != null && price.getSourceTimezone() != null &&
-                    !timezone.equals(price.getSourceTimezone())) {
-                price.setZonedTimestamp(
-                        timezoneService.convertTimezone(price.getZonedTimestamp(), timezone)
-                );
+            // Check if we should add/update with the real-time price
+            if (!prices.isEmpty()) {
+                // Get the most recent price
+                StockPriceDto mostRecent = prices.getLast();
+
+                // Only add if real-time price is more recent
+                if (realtimePrice.getTimestamp().isAfter(mostRecent.getTimestamp())) {
+                    // Calculate change vs. first price point for consistency
+                    if (!prices.isEmpty()) {
+                        calculateChangeForRealTimePrice(prices, realtimePrice);
+                    }
+
+                    prices.add(realtimePrice);
+                }
+            } else {
+                // If no other prices, just add the real-time price
+                prices.add(realtimePrice);
             }
         }
 
-        return intradayPrices;
+        return prices;
     }
 
     @Override
     public List<StockPriceDto> getWeeklyPrices(String symbol, int weeks) {
-        // Call the timezone-aware version with default market timezone
         return getWeeklyPrices(symbol, weeks, TimezoneService.DEFAULT_MARKET_TIMEZONE);
     }
 
     @Override
-    public List<StockPriceDto> getWeeklyPrices(String symbol, int weeks, ZoneId timezone) {
-        // Register this symbol for automatic tracking
+    public List<StockPriceDto> getWeeklyPrices(String symbol, int weeks, ZoneId userTimezone) {
+        symbol = symbol.toUpperCase();
+
+        // Register for real-time updates
         registerSymbolForTracking(symbol);
 
-        List<StockPriceDto> weeklyPrices = apiClient.getWeeklyPrices(symbol);
+        // Calculate date range
+        LocalDateTime endTime = LocalDateTime.now();
+        LocalDateTime startTime = endTime.minusWeeks(weeks);
 
-        // Ensure timezone information is properly set
-        for (StockPriceDto price : weeklyPrices) {
-            if (price.getZonedTimestamp() == null && price.getTimestamp() != null) {
-                ZonedDateTime marketTime = price.getTimestamp()
-                        .atZone(TimezoneService.DEFAULT_MARKET_TIMEZONE);
-                price.setZonedTimestamp(marketTime);
-                price.setSourceTimezone(TimezoneService.DEFAULT_MARKET_TIMEZONE);
-            }
+        // Get data with daily timeframe from Alpaca
+        List<StockPriceDto> prices = alpacaClient.getHistoricalBars(
+                symbol, "1Day", startTime, endTime);
 
-            // Convert to requested timezone if needed
-            if (timezone != null && price.getSourceTimezone() != null &&
-                    !timezone.equals(price.getSourceTimezone())) {
-                price.setZonedTimestamp(
-                        timezoneService.convertTimezone(price.getZonedTimestamp(), timezone)
-                );
+        // Group by week to get weekly data
+        Map<LocalDateTime, List<StockPriceDto>> weeklyData = new HashMap<>();
+        for (StockPriceDto price : prices) {
+            // Group by the start of the week
+            LocalDateTime weekStart = price.getTimestamp().toLocalDate()
+                    .with(java.time.temporal.TemporalAdjusters.previousOrSame(java.time.DayOfWeek.MONDAY))
+                    .atStartOfDay();
+
+            weeklyData.computeIfAbsent(weekStart, k -> new ArrayList<>()).add(price);
+        }
+
+        // For each week, take the last day's data
+        List<StockPriceDto> weeklyPrices = new ArrayList<>();
+        for (List<StockPriceDto> weekPrices : weeklyData.values()) {
+            weekPrices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
+            if (!weekPrices.isEmpty()) {
+                weeklyPrices.add(weekPrices.getLast());
             }
         }
 
-        // Limit to requested number of weeks
-        return weeklyPrices.stream()
-                .limit(weeks)
-                .collect(Collectors.toList());
+        // Sort by date
+        weeklyPrices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
+
+        // Calculate changes
+        calculateChangesFromReference(weeklyPrices);
+
+        return weeklyPrices;
     }
 
     @Override
     public List<StockPriceDto> getMonthlyPrices(String symbol, int months) {
-        // Call the timezone-aware version with default market timezone
         return getMonthlyPrices(symbol, months, TimezoneService.DEFAULT_MARKET_TIMEZONE);
     }
 
     @Override
-    public List<StockPriceDto> getMonthlyPrices(String symbol, int months, ZoneId timezone) {
-        // Register this symbol for automatic tracking
+    public List<StockPriceDto> getMonthlyPrices(String symbol, int months, ZoneId userTimezone) {
+        symbol = symbol.toUpperCase();
+
+        // Register for real-time updates
         registerSymbolForTracking(symbol);
 
-        List<StockPriceDto> monthlyPrices = apiClient.getMonthlyPrices(symbol);
+        // Calculate date range
+        LocalDateTime endTime = LocalDateTime.now();
+        LocalDateTime startTime = endTime.minusMonths(months);
 
-        // Ensure timezone information is properly set
-        for (StockPriceDto price : monthlyPrices) {
-            if (price.getZonedTimestamp() == null && price.getTimestamp() != null) {
-                ZonedDateTime marketTime = price.getTimestamp()
-                        .atZone(TimezoneService.DEFAULT_MARKET_TIMEZONE);
-                price.setZonedTimestamp(marketTime);
-                price.setSourceTimezone(TimezoneService.DEFAULT_MARKET_TIMEZONE);
-            }
+        // Get data with weekly timeframe from Alpaca for better performance
+        List<StockPriceDto> prices = alpacaClient.getHistoricalBars(
+                symbol, "1Week", startTime, endTime);
 
-            // Convert to requested timezone if needed
-            if (timezone != null && price.getSourceTimezone() != null &&
-                    !timezone.equals(price.getSourceTimezone())) {
-                price.setZonedTimestamp(
-                        timezoneService.convertTimezone(price.getZonedTimestamp(), timezone)
-                );
+        // Group by month to get monthly data
+        Map<String, List<StockPriceDto>> monthlyData = new HashMap<>();
+        for (StockPriceDto price : prices) {
+            // Group by year-month
+            String yearMonth = price.getTimestamp().getYear() + "-" +
+                    String.format("%02d", price.getTimestamp().getMonthValue());
+
+            monthlyData.computeIfAbsent(yearMonth, k -> new ArrayList<>()).add(price);
+        }
+
+        // For each month, take the last day's data
+        List<StockPriceDto> monthlyPrices = new ArrayList<>();
+        for (List<StockPriceDto> monthPrices : monthlyData.values()) {
+            monthPrices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
+            if (!monthPrices.isEmpty()) {
+                monthlyPrices.add(monthPrices.getLast());
             }
         }
 
-        // Limit to requested number of months
-        return monthlyPrices.stream()
-                .limit(months)
-                .collect(Collectors.toList());
-    }
+        // Sort by date
+        monthlyPrices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
 
+        // Calculate changes
+        calculateChangesFromReference(monthlyPrices);
+
+        return monthlyPrices;
+    }
 
     @Override
     public List<StockPriceDto> getPricesForTimeframe(String symbol, String timeframe) {
-        // Call the timezone-aware version with default market timezone
         return getPricesForTimeframe(symbol, timeframe, TimezoneService.DEFAULT_MARKET_TIMEZONE);
     }
 
     @Override
-    public List<StockPriceDto> getPricesForTimeframe(String symbol, String timeframe, ZoneId timezone) {
-        // Register this symbol for automatic tracking
+    public List<StockPriceDto> getPricesForTimeframe(String symbol, String timeframe, ZoneId userTimezone) {
+        symbol = symbol.toUpperCase();
+
+        // Register for real-time updates
         registerSymbolForTracking(symbol);
 
-        // Use ZonedDateTime and market timezone for accurate date calculations
-        ZoneId marketTimezone = ZoneId.of("America/New_York");
-        ZonedDateTime nowInMarketTz = ZonedDateTime.now(marketTimezone);
-        List<StockPriceDto> prices;
+        LocalDateTime endTime = LocalDateTime.now();
+        LocalDateTime startTime;
+        String alpacaTimeframe;
 
+        // Determine the timeframe parameters based on requirements
         switch (timeframe.toLowerCase()) {
             case "1d":
-                // Fetch 5-minute interval data for the day
-                List<StockPriceDto> intradayPrices = getIntradayPrices(symbol, "5min", timezone);
-                // Filter down to only the most recent trading day's data
-                prices = filterForMostRecentTradingDay(intradayPrices); // Assumes this sorts oldest first
+                startTime = endTime.minusDays(1);
+                alpacaTimeframe = "5Min"; // 5-minute intervals for 1-day chart
                 break;
-
             case "1w":
-                // Fetch 30-minute interval data
-                List<StockPriceDto> allWeeklyPrices = getIntradayPrices(symbol, "30min", timezone);
-
-                // Calculate the date 7 days ago in market time
-                LocalDate weekAgoMarket = nowInMarketTz.toLocalDate().minusDays(7);
-
-                // Filter for the last 7 calendar days
-                prices = allWeeklyPrices.stream()
-                        .filter(price -> {
-                            // Convert timestamp to market timezone for accurate date comparison
-                            ZonedDateTime priceTimeMarket = price.getZonedTimestamp()
-                                    .withZoneSameInstant(marketTimezone);
-                            LocalDate priceDateMarket = priceTimeMarket.toLocalDate();
-
-                            // Keep data points within the last 7 calendar days (inclusive)
-                            return !priceDateMarket.isBefore(weekAgoMarket) && !priceDateMarket.isAfter(nowInMarketTz.toLocalDate());
-                        })
-                        .sorted(Comparator.comparing(StockPriceDto::getZonedTimestamp))
-                        .collect(Collectors.toList());
-
-                // Fallback if filtering removed all data (less likely with intraday but safe)
-                if (prices.isEmpty() && !allWeeklyPrices.isEmpty()) {
-                    // Get the most recent 7 data points as fallback
-                    prices = getRecentTradingData(allWeeklyPrices, 7); // Assumes this sorts oldest first
-                    log.warn("Filtering for 1w resulted in empty list for {}, using most recent points fallback.", symbol);
-                }
+                startTime = endTime.minusWeeks(1);
+                alpacaTimeframe = "30Min"; // 30-minute intervals for 1-week chart
                 break;
-
             case "1m":
-                log.debug("Fetching '1m' timeframe data for {} using 60min interval.", symbol);
-                // Fetch intraday data (e.g., 60min interval)
-                List<StockPriceDto> allMonthlyIntradayPrices = getIntradayPrices(symbol, "60min", timezone);
-
-                // Define the start date for filtering (1 month ago in market time)
-                LocalDate monthAgoMarket = nowInMarketTz.toLocalDate().minusMonths(1);
-
-                // Filter the results to the precise 1-month window
-                prices = allMonthlyIntradayPrices.stream()
-                        .filter(price -> {
-                            // Convert timestamp to market timezone for accurate date comparison
-                            ZonedDateTime priceTimeMarket = price.getZonedTimestamp()
-                                    .withZoneSameInstant(marketTimezone);
-                            LocalDate priceDateMarket = priceTimeMarket.toLocalDate();
-
-                            // Keep data points from the last month (inclusive)
-                            return !priceDateMarket.isBefore(monthAgoMarket) && !priceDateMarket.isAfter(nowInMarketTz.toLocalDate());
-                        })
-                        .sorted(Comparator.comparing(StockPriceDto::getZonedTimestamp))
-                        .collect(Collectors.toList());
-
-                // If intraday fetch/filter failed or returned too little data, fallback to daily
-                // If < 5 points, daily might be better.
-                if (prices.size() < 5 && !allMonthlyIntradayPrices.isEmpty()) { // Check if filtering removed almost everything
-                    log.warn("Intraday data for 1m timeframe for {} resulted in only {} points after filtering. Falling back to daily data.", symbol, prices.size());
-                    LocalDateTime end = nowInMarketTz.toLocalDateTime();
-                    LocalDateTime start = end.minusMonths(1);
-                    prices = getHistoricalPrices(symbol, start, end, timezone);
-                    // Ensure daily data is also sorted correctly if not already done in getHistoricalPrices
-                    prices.sort(Comparator.comparing(StockPriceDto::getTimestamp)); // Use getTimestamp if Zoned might be null from DB
-                } else if (allMonthlyIntradayPrices.isEmpty()) {
-                    log.warn("Intraday data for 1m timeframe for {} was empty. Falling back to daily data.", symbol);
-                    LocalDateTime end = nowInMarketTz.toLocalDateTime();
-                    LocalDateTime start = end.minusMonths(1);
-                    prices = getHistoricalPrices(symbol, start, end, timezone);
-                    prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
-                }
+                startTime = endTime.minusMonths(1);
+                alpacaTimeframe = "2Hour"; // 2-hour intervals for 1-month chart
                 break;
-
             case "3m":
-                // 3 months - use daily data
-                LocalDateTime end3m = nowInMarketTz.toLocalDateTime();
-                LocalDateTime start3m = end3m.minusMonths(3);
-                prices = getHistoricalPrices(symbol, start3m, end3m, timezone);
-                // Ensure sorted oldest first if getHistoricalPrices doesn't guarantee it
-                prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
+                startTime = endTime.minusMonths(3);
+                alpacaTimeframe = "12Hour"; // 12-hour intervals for 3-month chart
                 break;
-
             case "1y":
-                // 1 year - use weekly data
-                prices = getWeeklyPrices(symbol, 52, timezone); // Assumes API client returns newest first
-                // Sort oldest first for calculateChangesFromReference
-                prices.sort(Comparator.comparing(StockPriceDto::getZonedTimestamp));
+                startTime = endTime.minusYears(1);
+                alpacaTimeframe = "1Day"; // 1-day intervals for 1-year chart
                 break;
-
             case "5y":
-                // 5 years - use monthly data
-                prices = getMonthlyPrices(symbol, 60, timezone); // Assumes API client returns newest first
-                // Sort oldest first for calculateChangesFromReference
-                prices.sort(Comparator.comparing(StockPriceDto::getZonedTimestamp));
+                // For 5-year data, use a date 3 days before current date to ensure we can use "sip" feed
+                endTime = LocalDateTime.now().minusDays(3);
+                startTime = endTime.minusYears(5);
+                alpacaTimeframe = "1Week"; // 1-week intervals for 5-year chart
                 break;
-
             default:
-                log.warn("Unsupported timeframe '{}', defaulting to '1m'", timeframe);
-                // Default to 1 month - Apply the same improved logic as "1m" case
-
-                List<StockPriceDto> defaultIntradayPrices = getIntradayPrices(symbol, "60min", timezone);
-                LocalDate defaultMonthAgo = nowInMarketTz.toLocalDate().minusMonths(1);
-
-                prices = defaultIntradayPrices.stream()
-                        .filter(price -> {
-                            ZonedDateTime priceTimeMarket = price.getZonedTimestamp().withZoneSameInstant(marketTimezone);
-                            LocalDate priceDateMarket = priceTimeMarket.toLocalDate();
-                            return !priceDateMarket.isBefore(defaultMonthAgo) && !priceDateMarket.isAfter(nowInMarketTz.toLocalDate());
-                        })
-                        .sorted(Comparator.comparing(StockPriceDto::getZonedTimestamp)) // Sort oldest first
-                        .collect(Collectors.toList());
-
-                // Fallback for default case
-                if (prices.size() < 5 && !defaultIntradayPrices.isEmpty()) {
-                    log.warn("Default timeframe (1m) for {} resulted in only {} points after filtering intraday. Falling back to daily.", symbol, prices.size());
-                    LocalDateTime end = nowInMarketTz.toLocalDateTime();
-                    LocalDateTime start = end.minusMonths(1);
-                    prices = getHistoricalPrices(symbol, start, end, timezone);
-                    prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
-                } else if (defaultIntradayPrices.isEmpty()){
-                    log.warn("Default timeframe (1m) for {} intraday data was empty. Falling back to daily.", symbol);
-                    LocalDateTime end = nowInMarketTz.toLocalDateTime();
-                    LocalDateTime start = end.minusMonths(1);
-                    prices = getHistoricalPrices(symbol, start, end, timezone);
-                    prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
-                }
-                break;
+                log.warn("Unsupported timeframe: {}, defaulting to 1m", timeframe);
+                startTime = endTime.minusMonths(1);
+                alpacaTimeframe = "2Hour"; // Default to 1-month view
         }
 
-        calculateChangesFromReference(prices);
-        return prices;
-    }
+        // Get price data from Alpaca
+        List<StockPriceDto> prices = alpacaClient.getHistoricalBars(
+                symbol, alpacaTimeframe, startTime, endTime);
 
+        // Filter out pre-market data that falls outside regular market hours
+        // This is especially needed for the 1w timeframe where Alpaca returns 13:00 UTC (9:00 AM NY)
+        boolean isIntraday = timeframe.equalsIgnoreCase("1d") || timeframe.equalsIgnoreCase("1w");
+        if (isIntraday && !prices.isEmpty()) {
+            prices = prices.stream()
+                    .filter(price -> {
+                        // Convert to NY time to check market hours
+                        ZonedDateTime nyTime = null;
+                        if (price.getZonedTimestamp() != null) {
+                            nyTime = price.getZonedTimestamp()
+                                    .withZoneSameInstant(ZoneId.of("America/New_York"));
+                        } else if (price.getTimestamp() != null) {
+                            // Fallback to timestamp if zonedTimestamp is not available
+                            nyTime = price.getTimestamp()
+                                    .atZone(ZoneId.of("UTC"))
+                                    .withZoneSameInstant(ZoneId.of("America/New_York"));
+                        }
 
-    /**
-     * Filters data to show only the most recent trading day
-     */
-    public List<StockPriceDto> filterForMostRecentTradingDay(List<StockPriceDto> allPrices) {
-        if(allPrices.isEmpty()) return allPrices;
+                        if (nyTime != null) {
+                            int hour = nyTime.getHour();
+                            int minute = nyTime.getMinute();
 
-        // Get current date in NYSE timezone
-        LocalDate todayNY = LocalDate.now(ZoneId.of("America/New_York"));
+                            // Only keep times from 9:30 AM to 4:00 PM NY time
+                            return (hour > 9 || (hour == 9 && minute >= 30)) && hour < 16;
+                        }
 
+                        return true; // Keep data if we can't determine the time
+                    })
+                    .collect(Collectors.toList());
 
-        // First, try to filter today's data
-        List<StockPriceDto> todayPrices = allPrices.stream()
-                .filter(price -> {
-                    ZonedDateTime nyTime = price.getZonedTimestamp()
-                            .withZoneSameInstant(ZoneId.of("America/New_York"));
-                    return nyTime.toLocalDate().equals(todayNY);
-                })
-                .collect(Collectors.toList());
+            if (!prices.isEmpty()) {
+                log.debug("Filtered to {} data points within market hours for {}",
+                        prices.size(), symbol);
+            }
+        }
 
-        // If we have today's data, use it
-        if(!todayPrices.isEmpty()) {
-            return todayPrices;
-        } else {
-            Optional<LocalDate> mostRecentTradingDay = allPrices.stream()
-                    .map(price -> price.getZonedTimestamp()
-                            .withZoneSameInstant(ZoneId.of("America/New_York"))
-                            .toLocalDate())
-                    .max(LocalDate::compareTo);
+        // Add fallback logic for 1d timeframe when no data is found
+        if (prices.isEmpty() && timeframe.equalsIgnoreCase("1d")) {
+            log.info("No data found in 1d window, fetching most recent trading day for {}", symbol);
 
-            if(mostRecentTradingDay.isPresent()) {
-                LocalDate recentDay = mostRecentTradingDay.get();
-                return allPrices.stream()
+            // Extend the search to the past 5 days to find the most recent trading day
+            LocalDateTime extendedStart = endTime.minusDays(5);
+            List<StockPriceDto> extendedPrices = alpacaClient.getHistoricalBars(
+                    symbol, alpacaTimeframe, extendedStart, endTime);
+
+            if (!extendedPrices.isEmpty()) {
+                // Filter to market hours
+                extendedPrices = extendedPrices.stream()
                         .filter(price -> {
                             ZonedDateTime nyTime = price.getZonedTimestamp()
                                     .withZoneSameInstant(ZoneId.of("America/New_York"));
-                            return nyTime.toLocalDate().equals(recentDay);
-                        }).collect(Collectors.toList());
-            } else {
-                // Fallback if no data available
-                return allPrices;
+                            int hour = nyTime.getHour();
+                            int minute = nyTime.getMinute();
+
+                            // Only keep times from 9:30 AM to 4:00 PM NY time
+                            return (hour > 9 || (hour == 9 && minute >= 30)) && hour < 16;
+                        })
+                        .toList();
+
+                // Group prices by day
+                Map<LocalDate, List<StockPriceDto>> pricesByDay = extendedPrices.stream()
+                        .collect(Collectors.groupingBy(p -> p.getTimestamp().toLocalDate()));
+
+                // Get the most recent trading day with data
+                LocalDate mostRecentDay = pricesByDay.keySet().stream()
+                        .max(LocalDate::compareTo)
+                        .orElse(null);
+
+                if (mostRecentDay != null) {
+                    prices = pricesByDay.get(mostRecentDay);
+                    log.info("Using data from most recent trading day: {} for symbol {}",
+                            mostRecentDay, symbol);
+                }
             }
         }
-    }
 
-    /**
-     * Gets the most recent N days of trading data
-     */
-    private List<StockPriceDto> getRecentTradingData(List<StockPriceDto> allPrices, int days) {
-        if(allPrices.isEmpty()) return allPrices;
+        // Save to database for future use
+        for (StockPriceDto price : prices) {
+            saveStockPriceFromDto(price);
+        }
 
-        List<LocalDate> tradingDays = allPrices.stream()
-                .map(price -> price.getZonedTimestamp()
-                        .withZoneSameInstant(ZoneId.of("America/New_York"))
-                        .toLocalDate())
-                .distinct()
-                .sorted()
-                .toList();
+        // Add the latest real-time price if available and if it's more recent
+        StockPriceDto realtimePrice = realtimePrices.get(symbol);
+        if (realtimePrice != null) {
+            // Convert to user timezone if needed
+            if (userTimezone != null && !userTimezone.equals(realtimePrice.getSourceTimezone())) {
+                realtimePrice = convertToUserTimezone(realtimePrice, userTimezone);
+            }
 
-        List<LocalDate> recentDays = tradingDays.stream()
-                .limit(days)
-                .toList();
+            // Check if we should add the real-time price
+            if (!prices.isEmpty()) {
+                StockPriceDto lastPrice = prices.getLast();
 
-        return allPrices.stream()
-                .filter(prices -> {
-                    LocalDate priceDate = prices.getZonedTimestamp()
-                            .withZoneSameInstant(ZoneId.of("America/New_York"))
-                            .toLocalDate();
+                // Only add if real-time price is more recent
+                if (realtimePrice.getTimestamp().isAfter(lastPrice.getTimestamp())) {
+                    // Calculate change relative to first price
+                    calculateChangeForRealTimePrice(prices, realtimePrice);
 
-                    return recentDays.contains(priceDate);
-                }).collect(Collectors.toList());
+                    prices.add(realtimePrice);
+                }
+            } else {
+                // If no historical prices, just add the real-time price
+                prices.add(realtimePrice);
+            }
+        }
+
+        return prices;
     }
 
     @Override
     public List<SearchResultDto> searchStocks(String keywords) {
         log.info("Searching for stocks matching: {}", keywords);
 
-        List<Map<String, String>> searchResults = apiClient.searchSymbol(keywords);
-
-        return searchResults.stream()
-                .map(result -> SearchResultDto.builder()
-                        .symbol(result.get("1. symbol"))
-                        .name(result.get("2. name"))
-                        .type(result.get("3. type"))
-                        .region(result.get("4. region"))
-                        .currency(result.get("8. currency"))
-                        .build())
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Scheduled method that runs automatically to refresh prices
-     * for all actively tracked symbols
-     */
-    @Scheduled(fixedRate = 300000) // Run every 5 minutes
-    public void refreshActiveSymbols() {
-        if (activeSymbols.isEmpty()) {
-            log.info("No active symbols to refresh");
-            return;
-        }
-
-        log.info("Refreshing prices for {} active symbols", activeSymbols.size());
-        for (String symbol : activeSymbols) {
-            try {
-                StockPriceDto price = apiClient.getCurrentStockPrice(symbol);
-                saveStockPriceFromDto(price);
-                notifyObservers(price);
-                log.debug("Refreshed price for {}: {}", symbol, price.getPrice());
-            } catch (Exception e) {
-                log.error("Error refreshing price for {}: {}", symbol, e.getMessage());
-            }
-        }
+        // Use the AlpacaClient's search functionality
+        return alpacaClient.searchAssets(keywords);
     }
 
     @Override
@@ -570,33 +528,83 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
     }
 
     /**
-     * Calculates price changes relative to the reference (oldest) price
-     * @param prices List of price data points
+     * Converts a StockPriceDto to user's timezone
      */
-    private void calculateChangesFromReference(List<StockPriceDto> prices) {
-        if(prices.isEmpty()) return;
-
-        // Sort oldest to newest to get proper reference point
-        prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
-        BigDecimal referencePrice = prices.getFirst().getPrice();
-
-        for (StockPriceDto pricePoint : prices) {
-            BigDecimal priceChange = pricePoint.getPrice().subtract(referencePrice);
-            pricePoint.setChange(priceChange);
-
-            if (referencePrice.compareTo(BigDecimal.ZERO) > 0) {
-                BigDecimal changePercent = priceChange
-                        .multiply(new BigDecimal("100"))
-                        .divide(referencePrice, 4, RoundingMode.HALF_UP);
-                pricePoint.setChangePercent(changePercent);
-            } else {
-                pricePoint.setChangePercent(BigDecimal.ZERO);
-            }
+    private StockPriceDto convertToUserTimezone(StockPriceDto price, ZoneId userTimezone) {
+        if (price == null || userTimezone == null ||
+                (price.getSourceTimezone() != null && userTimezone.equals(price.getSourceTimezone()))) {
+            return price;
         }
+
+        // Create converted timestamp
+        ZonedDateTime userTime;
+        if (price.getZonedTimestamp() != null) {
+            // If we have zoned timestamp, ensure it's properly converted
+            // Alpaca API sends UTC timestamps
+            ZonedDateTime utcTime = price.getZonedTimestamp();
+
+            log.debug("Original timestamp: {} in timezone {}",
+                    utcTime, price.getSourceTimezone() != null ? price.getSourceTimezone() : "UTC");
+            // First convert to market timezone to ensure proper market hours
+            ZonedDateTime marketTime = utcTime.withZoneSameInstant(ZoneId.of("America/New_York"));
+
+            // Then convert to user timezone to ensure proper market hours
+            userTime = marketTime.withZoneSameInstant(userTimezone);
+
+            log.debug("Converted timestamp: {} in timezone {}", userTime, userTimezone);
+        } else if (price.getTimestamp() != null) {
+            // For legacy non-zoned timestamps, assume they're in UTC
+            ZonedDateTime utcTime = price.getTimestamp().atZone(ZoneId.of("UTC"));
+
+            // Convert to market timezone first, then to user timezone
+            ZonedDateTime marketTime = utcTime.withZoneSameInstant(ZoneId.of("America/New_York"));
+            userTime = marketTime.withZoneSameInstant(userTimezone);
+
+        } else {
+            // If no timestamp at all, use current time
+            userTime = ZonedDateTime.now(userTimezone);
+        }
+
+        return StockPriceDto.builder()
+                .symbol(price.getSymbol())
+                .price(price.getPrice())
+                .open(price.getOpen())
+                .high(price.getHigh())
+                .low(price.getLow())
+                .volume(price.getVolume())
+                .change(price.getChange())
+                .changePercent(price.getChangePercent())
+                .timestamp(price.getTimestamp()) // Keep original timestamp for database
+                .zonedTimestamp(userTime) // Use user timezone
+                .sourceTimezone(userTimezone) // Mark as converted
+                .build();
     }
 
+    /**
+     * Converts a stock price entity from database to DTO
+     */
+    private StockPriceDto convertToDto(StockPrice entity) {
+        // Database time is in UTC
+        ZonedDateTime utcZoned = entity.getTime().atZone(ZoneId.of("UTC"));
+
+        return StockPriceDto.builder()
+                .symbol(entity.getSymbol())
+                .price(entity.getPrice())
+                .open(entity.getOpen())
+                .high(entity.getHigh())
+                .low(entity.getLow())
+                .volume(entity.getVolume())
+                .timestamp(utcZoned.toLocalDateTime())
+                .zonedTimestamp(utcZoned)
+                .sourceTimezone(ZoneId.of("UTC"))
+                .build();
+    }
+
+    /**
+     * Saves a StockPriceDto to the database
+     */
     private void saveStockPriceFromDto(StockPriceDto dto) {
-        // Convert timestamp to UTC for database storage
+        // Convert to UTC for database storage
         LocalDateTime utcTime;
 
         if (dto.getZonedTimestamp() != null) {
@@ -607,17 +615,16 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
             ZonedDateTime zonedTime = dto.getTimestamp().atZone(dto.getSourceTimezone());
             utcTime = timezoneService.toUtcLocalDateTime(zonedTime);
         } else if (dto.getTimestamp() != null) {
-            // If we only have a local timestamp without timezone, assume it's in market timezone
-            ZonedDateTime zonedTime = dto.getTimestamp().atZone(TimezoneService.DEFAULT_MARKET_TIMEZONE);
-            utcTime = timezoneService.toUtcLocalDateTime(zonedTime);
+            // If we only have a local timestamp without timezone, assume UTC
+            utcTime = dto.getTimestamp();
         } else {
             // No timestamp available, use current time
             utcTime = LocalDateTime.now();
         }
 
         StockPrice entity = new StockPrice();
-        entity.setSymbol(dto.getSymbol());
-        entity.setTime(utcTime);  // Store in UTC
+        entity.setSymbol(dto.getSymbol().toUpperCase());
+        entity.setTime(utcTime);
         entity.setPrice(dto.getPrice());
         entity.setOpen(dto.getOpen());
         entity.setHigh(dto.getHigh());
@@ -627,24 +634,89 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
         saveStockPrice(entity);
     }
 
-    private StockPriceDto convertToDto(StockPrice entity) {
-        // The time from database is in UTC, convert to ZonedDateTime
-        ZonedDateTime utcZoned = entity.getTime().atZone(ZoneId.of("UTC"));
+    /**
+     * Calculates price changes relative to reference price (first in list)
+     */
+    private void calculateChangesFromReference(List<StockPriceDto> prices) {
+        if (prices == null || prices.isEmpty()) {
+            return;
+        }
 
-        // Convert to market timezone for business logic
-        ZonedDateTime marketZoned = utcZoned.withZoneSameInstant(timezoneService.DEFAULT_MARKET_TIMEZONE);
+        // Sort by timestamp to ensure correct order
+        prices.sort(Comparator.comparing(StockPriceDto::getTimestamp));
 
-        return StockPriceDto.builder()
-                .symbol(entity.getSymbol())
-                .price(entity.getPrice())
-                .open(entity.getOpen())
-                .high(entity.getHigh())
-                .low(entity.getLow())
-                .volume(entity.getVolume())
-                .timestamp(marketZoned.toLocalDateTime())  // Keep for backward compatibility
-                .zonedTimestamp(marketZoned)               // Store the zoned timestamp
-                .sourceTimezone(TimezoneService.DEFAULT_MARKET_TIMEZONE)  // Note the timezone
-                .build();
+        // Use first price as reference
+        BigDecimal referencePrice = prices.getFirst().getPrice();
+
+        // Calculate changes for each price point
+        for (StockPriceDto price : prices) {
+            BigDecimal priceChange = price.getPrice().subtract(referencePrice);
+            price.setChange(priceChange);
+
+            if (referencePrice.compareTo(BigDecimal.ZERO) > 0) {
+                BigDecimal changePercent = priceChange
+                        .multiply(new BigDecimal("100"))
+                        .divide(referencePrice, 4, RoundingMode.HALF_UP);
+                price.setChangePercent(changePercent);
+            } else {
+                price.setChangePercent(BigDecimal.ZERO);
+            }
+        }
+    }
+
+    private void calculateChangeForRealTimePrice(List<StockPriceDto> prices, StockPriceDto realtimePrice) {
+        BigDecimal firstPrice = prices.getFirst().getPrice();
+        BigDecimal change = realtimePrice.getPrice().subtract(firstPrice);
+        realtimePrice.setChange(change);
+
+        if (firstPrice.compareTo(BigDecimal.ZERO) > 0) {
+            BigDecimal changePercent = change
+                    .multiply(new BigDecimal("100"))
+                    .divide(firstPrice, 4, RoundingMode.HALF_UP);
+            realtimePrice.setChangePercent(changePercent);
+        }
+    }
+
+    /**
+     * Determines appropriate Alpaca timeframe for a date range
+     */
+    private String determineTimeframeForDateRange(LocalDateTime start, LocalDateTime end) {
+        long days = java.time.Duration.between(start, end).toDays();
+
+        if (days <= 1) {
+            return "5Min";
+        } else if (days <= 7) {
+            return "30Min";
+        } else if (days <= 30) {
+            return "2Hour";
+        } else if (days <= 90) {
+            return "12Hour";
+        } else if (days <= 365) {
+            return "1Day";
+        } else {
+            return "1Week";
+        }
+    }
+
+    /**
+     * Converts interval string to Alpaca timeframe format
+     */
+    private String convertToAlpacaTimeframe(String interval) {
+        if (interval == null) {
+            return "5Min";
+        }
+
+        return switch (interval.toLowerCase()) {
+            case "1min" -> "1Min";
+            case "5min" -> "5Min";
+            case "15min" -> "15Min";
+            case "30min" -> "30Min";
+            case "60min", "1hour" -> "1Hour";
+            case "2hour" -> "2Hour";
+            case "1day" -> "1Day";
+            case "1week" -> "1Week";
+            default -> "5Min"; // Default
+        };
     }
 
     // Observer Pattern methods
