@@ -1,5 +1,6 @@
 package com.stockexchange.stock_platform.dto;
 
+import com.fasterxml.jackson.annotation.JsonFormat;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -17,16 +18,27 @@ import java.time.format.DateTimeFormatter;
 @Builder
 public class StockPriceDto {
     private String symbol;
+
+    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
     private BigDecimal price;
+
+    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
     private BigDecimal open;
+
+    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
     private BigDecimal high;
+
+    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
     private BigDecimal low;
     private Long volume;
-    private BigDecimal change;
-    private BigDecimal changePercent;
-    private LocalDateTime timestamp;
 
-    // for timezone handling
+    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
+    private BigDecimal change;
+
+    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
+    private BigDecimal changePercent;
+
+    private LocalDateTime timestamp;
     private ZonedDateTime zonedTimestamp;
     private ZoneId sourceTimezone;
 
