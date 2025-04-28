@@ -11,6 +11,9 @@ import com.stockexchange.stock_platform.service.api.AlpacaClient;
 import com.stockexchange.stock_platform.service.api.AlpacaWebSocketClient;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -80,6 +83,7 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
      * This method is called when the WebSocket client receives a price update
      */
     @Override
+    @CacheEvict(value = {"stockPrices_1d", "stockPrices_1w"}, key = "#stockPrice.symbol", condition = "#stockPrice != null")
     public void update(StockPriceDto stockPrice) {
         if (stockPrice == null || stockPrice.getSymbol() == null) {
             return;
@@ -105,6 +109,7 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
     }
 
     @Override
+    @Cacheable(value = "currentPrices", key = "#symbol + '-' + #userTimezone.id", unless = "#result == null")
     public StockPriceDto getCurrentPrice(String symbol, ZoneId userTimezone) {
         symbol = symbol.toUpperCase();
 
@@ -355,8 +360,18 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
         return getPricesForTimeframe(symbol, timeframe, TimezoneService.DEFAULT_MARKET_TIMEZONE);
     }
 
+    /**
+     * Uses cache for timeframe data with cache key that includes the symbol, timeframe and timezone
+     */
     @Override
+    @Cacheable(
+            cacheResolver = "stockPriceCacheResolver",
+            key           = "#symbol.toUpperCase() + '-' + #userTimezone.id",
+            unless        = "#result == null || #result.isEmpty()"
+    )
     public List<StockPriceDto> getPricesForTimeframe(String symbol, String timeframe, ZoneId userTimezone) {
+        log.debug("CACHE MISS: computing prices for {} [{}] in {}", symbol, timeframe, userTimezone);
+
         symbol = symbol.toUpperCase();
 
         // Register for real-time updates
@@ -717,6 +732,54 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
             case "1week" -> "1Week";
             default -> "5Min"; // Default
         };
+    }
+
+    /**
+     * Scheduled cache cleanup for all stock price caches
+     * This is helpful during non-trading hours to free memory
+     */
+    @Scheduled(cron = "0 0 0 * * *") // Midnight every day
+    @CacheEvict(value = {
+            "stockPrices_1d", "stockPrices_1w", "stockPrices_1m",
+            "stockPrices_3m", "stockPrices_1y", "stockPrices_5y",
+            "currentPrices"
+    }, allEntries = true)
+    public void clearCachesAtMidnight() {
+        log.info("Clearing all price caches at midnight");
+    }
+
+    /**
+     * Clear caches during market open/close transitions
+     */
+    @Scheduled(cron = "0 30 9,16 * * MON-FRI") // 9:30 AM and 4:00 PM on weekdays
+    @CacheEvict(value = {
+            "stockPrices_1d", "stockPrices_1w", "currentPrices"
+    }, allEntries = true)
+    public void checkMarketTransitions() {
+        boolean isOpen = isMarketOpen();
+        log.info("Market status check: {}", isOpen ? "OPEN" : "CLOSED");
+    }
+
+    /**
+     * Check if market is currently open
+     */
+    private boolean isMarketOpen() {
+        ZonedDateTime nyTime = ZonedDateTime.now(ZoneId.of("America/New_York"));
+
+        // Weekend check
+        int dayOfWeek = nyTime.getDayOfWeek().getValue();
+        if (dayOfWeek > 5) {
+            return false;
+        }
+
+        // Hours check (9:30 AM - 4:00 PM ET)
+        int hour = nyTime.getHour();
+        int minute = nyTime.getMinute();
+
+        if (hour < 9 || hour > 16) {
+            return false;
+        }
+        return hour != 9 || minute >= 30;
     }
 
     // Observer Pattern methods
