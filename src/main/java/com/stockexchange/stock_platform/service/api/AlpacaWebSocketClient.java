@@ -12,6 +12,7 @@ import com.stockexchange.stock_platform.pattern.observer.StockPriceSubject;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.socket.WebSocketSession;
 import org.springframework.web.reactive.socket.client.ReactorNettyWebSocketClient;
@@ -48,6 +49,7 @@ public class AlpacaWebSocketClient implements StockPriceSubject {
     private static final ZoneId UTC_TIMEZONE = ZoneId.of("UTC");
     private final WebSocketClient client;
     private Mono<Void> webSocketConnection;
+    private WebSocketSession webSocketSession;
 
     public AlpacaWebSocketClient(AlpacaConfig config, ObjectMapper objectMapper) {
         this.config = config;
@@ -87,6 +89,7 @@ public class AlpacaWebSocketClient implements StockPriceSubject {
                         URI.create(wsUrl),
                         session -> {
                             // Handle connection established
+                            this.webSocketSession = session;
                             isConnected.set(true);
                             log.info("Connected to Alpaca WebSocket");
 
@@ -295,45 +298,55 @@ public class AlpacaWebSocketClient implements StockPriceSubject {
     }
 
     /**
-     * Subscribe to real-time bar data for a specific symbol
+     * Subscribe to real-time bar data for a single symbol.
+     * Only actually sends one subscribe message the very first time.
      */
     public void subscribeToSymbol(String symbol) {
         if (symbol == null || symbol.isBlank()) {
             return;
         }
-
-        log.info("Subscribing to bar data for symbol: {}", symbol);
         symbol = symbol.toUpperCase();
 
-        // Add to our tracked symbols
-        subscribedSymbols.add(symbol);
+        // only send subscribe once per symbol
+        boolean newlyAdded = subscribedSymbols.add(symbol);
+        if (!newlyAdded) {
+            // already subscribed → nothing to do
+            return;
+        }
 
-        // If connected and authenticated, send subscription message
+        log.info("Subscribing to bar data for symbol: {}", symbol);
+
+        // if we’re already connected & authenticated, send the one subscribe frame now
         if (isConnected.get() && isAuthenticated.get()) {
             sendSubscriptionMessage(Collections.singletonList(symbol));
         }
     }
 
     /**
-     * Subscribe to real-time bar data for multiple symbols
+     * Subscribe to real-time bar data for multiple symbols in bulk.
+     * Only sends subscribe frames for newly added symbols.
      */
     public void subscribeToSymbols(List<String> symbols) {
         if (symbols == null || symbols.isEmpty()) {
             return;
         }
 
-        log.info("Subscribing to bar data for {} symbols", symbols.size());
-
-        // Add to our tracked symbols
-        for (String symbol : symbols) {
-            if (symbol != null && !symbol.isBlank()) {
-                subscribedSymbols.add(symbol.toUpperCase());
+        List<String> toActuallySubscribe = new ArrayList<>();
+        for (String s : symbols) {
+            if (s != null && !s.isBlank() && subscribedSymbols.add(s.toUpperCase())) {
+                toActuallySubscribe.add(s.toUpperCase());
             }
         }
 
-        // If connected and authenticated, send subscription message
+        if (toActuallySubscribe.isEmpty()) {
+            // nothing new to subscribe
+            return;
+        }
+
+        log.info("Subscribing to bar data for {} new symbols", toActuallySubscribe.size());
+
         if (isConnected.get() && isAuthenticated.get()) {
-            sendSubscriptionMessage(symbols);
+            sendSubscriptionMessage(toActuallySubscribe);
         }
     }
 
@@ -372,53 +385,18 @@ public class AlpacaWebSocketClient implements StockPriceSubject {
             String subscribeJson = objectMapper.writeValueAsString(subscribeMsg);
             log.debug("Sending subscription message: {}", subscribeJson);
 
-            // Send subscription message through a new session
-            // This is a simplified approach - in production, you'd want to reuse the existing session
-            client.execute(
-                    URI.create(config.getWsBaseUrl() + STOCKS_STREAM_PATH),
-                    session -> session.send(Mono.just(session.textMessage(subscribeJson)))
-            ).subscribe();
+            if (webSocketSession != null && webSocketSession.isOpen()) {
+                webSocketSession.send(Mono.just(webSocketSession.textMessage(subscribeJson)))
+                        .subscribe(
+                                null,
+                                error -> log.error("Error sending subscription: {}", error.getMessage()),
+                                () -> log.debug("Subscription message sent successfully")
+                        );
+            } else {
+                log.warn("Cannot send subscription - no active session or session disposed");
+            }
         } catch (Exception e) {
             log.error("Failed to subscribe to symbols: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * Unsubscribe from a symbol
-     */
-    public void unsubscribeFromSymbol(String symbol) {
-        if (symbol == null || symbol.isBlank() || !subscribedSymbols.contains(symbol.toUpperCase())) {
-            return;
-        }
-
-        symbol = symbol.toUpperCase();
-        log.info("Unsubscribing from symbol: {}", symbol);
-
-        // Remove from our tracked set
-        subscribedSymbols.remove(symbol);
-
-        // If connected, send unsubscribe message
-        if (isConnected.get() && isAuthenticated.get()) {
-            try {
-                // Create unsubscribe message
-                ObjectNode unsubscribeMsg = objectMapper.createObjectNode();
-                unsubscribeMsg.put("action", "unsubscribe");
-
-                // Only unsubscribe from bar data
-                ArrayNode barsArray = unsubscribeMsg.putArray("bars");
-                barsArray.add(symbol);
-
-                // Convert to JSON and send
-                String unsubscribeJson = objectMapper.writeValueAsString(unsubscribeMsg);
-
-                // Send unsubscribe message through a new session
-                client.execute(
-                        URI.create(config.getWsBaseUrl() + STOCKS_STREAM_PATH),
-                        session -> session.send(Mono.just(session.textMessage(unsubscribeJson)))
-                ).subscribe();
-            } catch (Exception e) {
-                log.error("Failed to unsubscribe from symbol {}: {}", symbol, e.getMessage());
-            }
         }
     }
 
