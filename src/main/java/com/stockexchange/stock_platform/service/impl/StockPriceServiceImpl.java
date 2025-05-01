@@ -13,6 +13,7 @@ import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -45,14 +46,18 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
     // Cache for real-time prices from WebSocket
     private final Map<String, StockPriceDto> realtimePrices = new ConcurrentHashMap<>();
 
+    private final SimpMessagingTemplate messagingTemplate;
+
     public StockPriceServiceImpl(AlpacaClient alpacaClient,
                                  AlpacaWebSocketClient webSocketClient,
                                  StockPriceRepository stockPriceRepository,
-                                 TimezoneService timezoneService) {
+                                 TimezoneService timezoneService,
+                                 SimpMessagingTemplate messagingTemplate) {
         this.alpacaClient = alpacaClient;
         this.webSocketClient = webSocketClient;
         this.stockPriceRepository = stockPriceRepository;
         this.timezoneService = timezoneService;
+        this.messagingTemplate = messagingTemplate;
     }
 
     @PostConstruct
@@ -96,6 +101,9 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
 
         // Save to database for historical record
         saveStockPriceFromDto(stockPrice);
+
+        // Send update via WebSocket
+        messagingTemplate.convertAndSend("/topic/prices/" + symbol, stockPrice);
 
         // Notify our own observers of the price update
         notifyObservers(stockPrice);
@@ -393,11 +401,11 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
                 break;
             case "1m":
                 startTime = endTime.minusMonths(1);
-                alpacaTimeframe = "2Hour"; // 2-hour intervals for 1-month chart
+                alpacaTimeframe = "1Hour"; // 1-hour intervals for 1-month chart
                 break;
             case "3m":
                 startTime = endTime.minusMonths(3);
-                alpacaTimeframe = "12Hour"; // 12-hour intervals for 3-month chart
+                alpacaTimeframe = "8Hour"; // 8-hour intervals for 3-month chart
                 break;
             case "1y":
                 startTime = endTime.minusYears(1);
@@ -412,7 +420,7 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
             default:
                 log.warn("Unsupported timeframe: {}, defaulting to 1m", timeframe);
                 startTime = endTime.minusMonths(1);
-                alpacaTimeframe = "2Hour"; // Default to 1-month view
+                alpacaTimeframe = "1Hour"; // Default to 1-month view
         }
 
         // Get price data from Alpaca
@@ -703,7 +711,7 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
         } else if (days <= 7) {
             return "30Min";
         } else if (days <= 30) {
-            return "2Hour";
+            return "1Hour";
         } else if (days <= 90) {
             return "12Hour";
         } else if (days <= 365) {
