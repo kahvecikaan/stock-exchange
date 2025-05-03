@@ -1,11 +1,13 @@
 package com.stockexchange.stock_platform.service.impl;
 
+import com.stockexchange.stock_platform.dto.MarketCalendarDto;
 import com.stockexchange.stock_platform.dto.SearchResultDto;
 import com.stockexchange.stock_platform.dto.StockPriceDto;
 import com.stockexchange.stock_platform.model.entity.StockPrice;
 import com.stockexchange.stock_platform.pattern.observer.StockPriceObserver;
 import com.stockexchange.stock_platform.pattern.observer.StockPriceSubject;
 import com.stockexchange.stock_platform.repository.StockPriceRepository;
+import com.stockexchange.stock_platform.service.MarketCalendarService;
 import com.stockexchange.stock_platform.service.StockPriceService;
 import com.stockexchange.stock_platform.service.api.AlpacaClient;
 import com.stockexchange.stock_platform.service.api.AlpacaWebSocketClient;
@@ -20,10 +22,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
+import java.time.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -36,6 +35,7 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
     private final AlpacaWebSocketClient webSocketClient;
     private final StockPriceRepository stockPriceRepository;
     private final TimezoneService timezoneService;
+    private final MarketCalendarService marketCalendarService;
 
     // Observers that will be notified of price updates
     private final List<StockPriceObserver> observers = new ArrayList<>();
@@ -52,11 +52,13 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
                                  AlpacaWebSocketClient webSocketClient,
                                  StockPriceRepository stockPriceRepository,
                                  TimezoneService timezoneService,
+                                 MarketCalendarService marketCalendarService,
                                  SimpMessagingTemplate messagingTemplate) {
         this.alpacaClient = alpacaClient;
         this.webSocketClient = webSocketClient;
         this.stockPriceRepository = stockPriceRepository;
         this.timezoneService = timezoneService;
+        this.marketCalendarService = marketCalendarService;
         this.messagingTemplate = messagingTemplate;
     }
 
@@ -392,12 +394,36 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
         // Determine the timeframe parameters based on requirements
         switch (timeframe.toLowerCase()) {
             case "1d":
-                startTime = endTime.minusDays(1);
-                alpacaTimeframe = "5Min"; // 5-minute intervals for 1-day chart
+                if (marketCalendarService.isMarketOpen()) {
+                    // Market is open today -> from NY open to NY now
+                    ZonedDateTime nyOpen = marketCalendarService.todayOpen();
+                    ZonedDateTime nyNow  = ZonedDateTime.now(MarketCalendarServiceImpl.NY);
+
+                    // convert both to UTC LocalDateTime for Alpaca’s API
+                    startTime = toUtcLocalDateTime(nyOpen);
+                    endTime   = toUtcLocalDateTime(nyNow);
+                } else {
+                    // Market closed -> use the last trading day’s full open to close
+                    MarketCalendarDto prev = marketCalendarService.lastTradingDay();
+                    ZonedDateTime prevOpen  = ZonedDateTime.of(prev.getDate(), prev.getOpen(),  MarketCalendarServiceImpl.NY);
+                    ZonedDateTime prevClose = ZonedDateTime.of(prev.getDate(), prev.getClose(), MarketCalendarServiceImpl.NY);
+
+                    startTime = prevOpen.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime();
+                    endTime   = prevClose.withZoneSameInstant(ZoneOffset.UTC).toLocalDateTime();
+                }
+                alpacaTimeframe = "5Min";
                 break;
             case "1w":
-                startTime = endTime.minusWeeks(1);
-                alpacaTimeframe = "30Min"; // 30-minute intervals for 1-week chart
+                // Start exactly one week ago at 09:30 New York time
+                ZonedDateTime nowNY   = ZonedDateTime.now(MarketCalendarServiceImpl.NY);
+                ZonedDateTime weekAgoOpen = nowNY
+                        .minusWeeks(1)
+                        .withHour(9).withMinute(30).withSecond(0).withNano(0);
+                // Alpaca wants UTC-local LocalDateTimes
+                startTime = toUtcLocalDateTime(weekAgoOpen);
+                // keep endTime as “now” in UTC
+                endTime = toUtcLocalDateTime(nowNY);
+                alpacaTimeframe = "30Min";
                 break;
             case "1m":
                 startTime = endTime.minusMonths(1);
@@ -548,6 +574,58 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
     @Transactional
     public void saveStockPrice(StockPrice stockPrice) {
         stockPriceRepository.save(stockPrice);
+    }
+
+    /**
+     * Scheduled cache cleanup for all stock price caches
+     * This is helpful during non-trading hours to free memory
+     */
+    @Scheduled(cron = "0 0 0 * * *") // Midnight every day
+    @CacheEvict(value = {
+            "stockPrices_1d", "stockPrices_1w", "stockPrices_1m",
+            "stockPrices_3m", "stockPrices_1y", "stockPrices_5y",
+            "currentPrices"
+    }, allEntries = true)
+    public void clearCachesAtMidnight() {
+        log.info("Clearing all price caches at midnight");
+    }
+
+    /**
+     * Clear caches during market open/close transitions
+     */
+    @Scheduled(cron = "0 30 9,16 * * MON-FRI") // 9:30 AM and 4:00 PM on weekdays
+    @CacheEvict(value = {
+            "stockPrices_1d", "stockPrices_1w", "currentPrices"
+    }, allEntries = true)
+    public void checkMarketTransitions() {
+        boolean isOpen = isMarketOpen();
+        log.info("Market status check: {}", isOpen ? "OPEN" : "CLOSED");
+    }
+
+    // Observer Pattern methods
+    @Override
+    public void registerObserver(StockPriceObserver observer) {
+        if (!observers.contains(observer)) {
+            observers.add(observer);
+        }
+    }
+
+    @Override
+    public void removeObserver(StockPriceObserver observer) {
+        observers.remove(observer);
+    }
+
+    @Override
+    public void notifyObservers(StockPriceDto stockPrice) {
+        for (StockPriceObserver observer : observers) {
+            observer.update(stockPrice);
+        }
+    }
+
+    /** Convert any ZonedDateTime -> UTC LocalDateTime for Alpaca calls */
+    private static LocalDateTime toUtcLocalDateTime(ZonedDateTime zdt) {
+        return zdt.withZoneSameInstant(ZoneOffset.UTC)
+                .toLocalDateTime();
     }
 
     /**
@@ -743,32 +821,6 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
     }
 
     /**
-     * Scheduled cache cleanup for all stock price caches
-     * This is helpful during non-trading hours to free memory
-     */
-    @Scheduled(cron = "0 0 0 * * *") // Midnight every day
-    @CacheEvict(value = {
-            "stockPrices_1d", "stockPrices_1w", "stockPrices_1m",
-            "stockPrices_3m", "stockPrices_1y", "stockPrices_5y",
-            "currentPrices"
-    }, allEntries = true)
-    public void clearCachesAtMidnight() {
-        log.info("Clearing all price caches at midnight");
-    }
-
-    /**
-     * Clear caches during market open/close transitions
-     */
-    @Scheduled(cron = "0 30 9,16 * * MON-FRI") // 9:30 AM and 4:00 PM on weekdays
-    @CacheEvict(value = {
-            "stockPrices_1d", "stockPrices_1w", "currentPrices"
-    }, allEntries = true)
-    public void checkMarketTransitions() {
-        boolean isOpen = isMarketOpen();
-        log.info("Market status check: {}", isOpen ? "OPEN" : "CLOSED");
-    }
-
-    /**
      * Check if market is currently open
      */
     private boolean isMarketOpen() {
@@ -788,25 +840,5 @@ public class StockPriceServiceImpl implements StockPriceService, StockPriceSubje
             return false;
         }
         return hour != 9 || minute >= 30;
-    }
-
-    // Observer Pattern methods
-    @Override
-    public void registerObserver(StockPriceObserver observer) {
-        if (!observers.contains(observer)) {
-            observers.add(observer);
-        }
-    }
-
-    @Override
-    public void removeObserver(StockPriceObserver observer) {
-        observers.remove(observer);
-    }
-
-    @Override
-    public void notifyObservers(StockPriceDto stockPrice) {
-        for (StockPriceObserver observer : observers) {
-            observer.update(stockPrice);
-        }
     }
 }

@@ -15,6 +15,7 @@ import com.stockexchange.stock_platform.pattern.factory.OrderRequestFactory;
 import com.stockexchange.stock_platform.repository.HoldingRepository;
 import com.stockexchange.stock_platform.repository.OrderRepository;
 import com.stockexchange.stock_platform.repository.UserRepository;
+import com.stockexchange.stock_platform.service.MarketCalendarService;
 import com.stockexchange.stock_platform.service.OrderService;
 import com.stockexchange.stock_platform.service.StockPriceService;
 import com.stockexchange.stock_platform.service.UserService;
@@ -42,6 +43,7 @@ public class OrderServiceImpl implements OrderService {
     private final HoldingRepository holdingRepository;
     private final UserService userService;
     private final StockPriceService stockPriceService;
+    private final MarketCalendarService marketCalendarService;
     private final Map<OrderType, OrderRequestFactory> orderFactories = new HashMap<>();
 
     public OrderServiceImpl(OrderRepository orderRepository,
@@ -49,12 +51,14 @@ public class OrderServiceImpl implements OrderService {
                             HoldingRepository holdingRepository,
                             UserService userService,
                             StockPriceService stockPriceService,
+                            MarketCalendarService marketCalendarService,
                             List<OrderRequestFactory> factoryList) {
         this.orderRepository = orderRepository;
         this.userRepository = userRepository;
         this.holdingRepository = holdingRepository;
         this.userService = userService;
         this.stockPriceService = stockPriceService;
+        this.marketCalendarService = marketCalendarService;
 
         // Register factories by order type
         for (OrderRequestFactory factory : factoryList) {
@@ -99,11 +103,12 @@ public class OrderServiceImpl implements OrderService {
         Order savedOrder = orderRepository.save(order);
 
         // For market orders, execute immediately if market is open, otherwise leave pending
-        if (type == OrderType.MARKET && isMarketOpen()) {
-            executeOrder(savedOrder);
-        } else if (type == OrderType.MARKET) {
-            // Market is closed, log that this will execute at open
-            log.info("Market order created during off hours. Will execute at market open: {}", savedOrder.getId());
+        if (type == OrderType.MARKET) {
+            if (marketCalendarService.isMarketOpen()) {
+                executeOrder(savedOrder);
+            } else {
+                log.info("Market order created off-hours; will execute at open: {}", savedOrder.getId());
+            }
         }
 
         return convertToDto(savedOrder);
@@ -152,10 +157,7 @@ public class OrderServiceImpl implements OrderService {
     @Scheduled(fixedRate = 60000) // Run every minute
     @Transactional
     public void processOrders() {
-        // Check if market is currently open
-        boolean marketOpen = isMarketOpen();
-
-        if (!marketOpen) {
+        if (!marketCalendarService.isMarketOpen()) {
             // Don't process orders when market is closed
             return;
         }
@@ -306,28 +308,5 @@ public class OrderServiceImpl implements OrderService {
                 .createdAt(order.getCreatedAt())
                 .updatedAt(order.getUpdatedAt())
                 .build();
-    }
-
-    // Helper method to check if market is open
-    private boolean isMarketOpen() {
-        ZonedDateTime nyTime = ZonedDateTime.now(ZoneId.of("America/New_York"));
-
-        // Check if weekend
-        DayOfWeek day = nyTime.getDayOfWeek();
-        if (day == DayOfWeek.SATURDAY || day == DayOfWeek.SUNDAY) {
-            return false;
-        }
-
-        // Check market hours (9:30 AM - 4:00 PM ET)
-        int hour = nyTime.getHour();
-        int minute = nyTime.getMinute();
-
-        // Before 9:30 AM
-        if (hour < 9 || (hour == 9 && minute < 30)) {
-            return false;
-        }
-
-        // After 4:00 PM
-        return hour < 16;
     }
 }

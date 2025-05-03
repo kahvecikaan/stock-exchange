@@ -1,8 +1,11 @@
 package com.stockexchange.stock_platform.service.api;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.stockexchange.stock_platform.config.AlpacaConfig;
+import com.stockexchange.stock_platform.dto.MarketCalendarDto;
+import com.stockexchange.stock_platform.dto.MarketClockDto;
 import com.stockexchange.stock_platform.dto.SearchResultDto;
 import com.stockexchange.stock_platform.dto.StockPriceDto;
 import com.stockexchange.stock_platform.exception.ExternalApiException;
@@ -16,6 +19,7 @@ import org.springframework.web.util.UriComponentsBuilder;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -155,11 +159,8 @@ public class AlpacaClient {
         try {
             String url = config.getDataBaseUrl() + "/v2/stocks/" + symbol + "/bars";
 
-            // Convert local datetimes to RFC-3339 formatted strings in UTC
-            ZonedDateTime utcStartTime = startTime.atZone(ZoneId.systemDefault())
-                    .withZoneSameInstant(ZoneId.of("UTC"));
-            ZonedDateTime utcEndTime = endTime.atZone(ZoneId.systemDefault())
-                    .withZoneSameInstant(ZoneId.of("UTC"));
+            ZonedDateTime utcStartTime = startTime.atZone(UTC_TIMEZONE);
+            ZonedDateTime utcEndTime   = endTime.atZone(UTC_TIMEZONE);
 
             // Store the exact formatted strings to reuse in pagination
             String startTimeStr = utcStartTime.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
@@ -239,6 +240,57 @@ public class AlpacaClient {
         catch (Exception e) {
             log.error("Error fetching bars for {}: {}", symbol, e.getMessage());
             throw handleApiException("Error fetching historical bars", e);
+        }
+    }
+
+    /**
+     * Call Alpaca’s /v2/clock endpoint to get current market open/close info.
+     */
+    public MarketClockDto getMarketClock() {
+        log.info("Fetching market clock from Alpaca");
+        String url = config.getPaperBaseUrl() + "/v2/clock";
+
+        try {
+            // re-use your builder + executeApiRequest
+            ResponseEntity<String> resp = executeApiRequest(builder(url));
+            MarketClockDto clock = objectMapper.readValue(resp.getBody(), MarketClockDto.class);
+            log.debug("Clock -> is_open={}, next_open={}, next_close={}",
+                    clock.isOpen(), clock.getNextOpen(), clock.getNextClose());
+            return clock;
+        } catch (JsonProcessingException e) {
+            log.error("JSON parse error for market clock: {}", e.getMessage());
+            throw handleApiException("Error parsing market clock", e);
+        } catch (Exception e) {
+            log.error("Failed to fetch market clock: {}", e.getMessage());
+            throw handleApiException("Error fetching market clock", e);
+        }
+    }
+
+    /**
+     * Call Alpaca’s /v2/calendar endpoint to retrieve trading days between start and end.
+     */
+    public List<MarketCalendarDto> getMarketCalendar(LocalDate start, LocalDate end) {
+        log.info("Fetching market calendar from {} to {}", start, end);
+        String url = config.getPaperBaseUrl()+ "/v2/calendar";
+
+        try {
+            UriComponentsBuilder b = builder(url)
+                    .queryParam("start", start.format(DateTimeFormatter.ISO_DATE))
+                    .queryParam("end",   end  .format(DateTimeFormatter.ISO_DATE))
+                    .queryParam("date_type", "TRADING");  // only trading dates
+
+            ResponseEntity<String> resp = executeApiRequest(b);
+            MarketCalendarDto[] cal = objectMapper.readValue(
+                    resp.getBody(), MarketCalendarDto[].class);
+
+            log.debug("Calendar entries returned: {}", cal.length);
+            return Arrays.asList(cal);
+        } catch (JsonProcessingException e) {
+            log.error("JSON parse error for market calendar: {}", e.getMessage());
+            throw handleApiException("Error parsing market calendar", e);
+        } catch (Exception e) {
+            log.error("Failed to fetch market calendar: {}", e.getMessage());
+            throw handleApiException("Error fetching market calendar", e);
         }
     }
 

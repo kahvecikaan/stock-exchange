@@ -13,6 +13,7 @@ public class AlpacaConfig {
     private String apiKey;
     private String apiSecret;
     private String dataBaseUrl;
+    private String paperBaseUrl;
     private String tradingBaseUrl;
     private String wsBaseUrl;
     private int maxRequestPerMinute = 200;
