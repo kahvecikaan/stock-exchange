@@ -7,8 +7,6 @@ import com.stockexchange.stock_platform.service.OrderService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.coyote.Response;
-import org.aspectj.weaver.ast.Or;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -26,6 +24,7 @@ public class OrderController {
     @PostMapping
     public ResponseEntity<OrderDto> placeOrder(@Valid @RequestBody PlaceOrderRequestDto orderRequest) {
         log.info("Placing {} for user ID: {}, symbol: {}, quantity: {}",
+                orderRequest.getUserId(),
                 orderRequest.getOrderType(),
                 orderRequest.getSymbol(),
                 orderRequest.getQuantity());
